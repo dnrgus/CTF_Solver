@@ -26,6 +26,9 @@ def _tools_to_openai(tools: list[ToolDef]) -> list[dict]:
     ]
 
 
+VISION_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision"}
+
+
 class ZAISession(SolverSession):
     def __init__(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> None:
         self._solver_id = solver_id
@@ -44,22 +47,35 @@ class ZAISession(SolverSession):
             self._client = httpx.AsyncClient(timeout=300.0)
         return self._client
 
+    def _supports_vision(self) -> bool:
+        model_lower = self._model.lower()
+        return any(vm in model_lower for vm in VISION_MODELS)
+
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
+        n_before = len(self._messages)
         if tool_results:
             pending_image_parts: list[dict] = []
             for tr in tool_results:
                 if isinstance(tr.content, tuple):
-                    image_data, mime_type = tr.content
-                    b64 = base64.b64encode(image_data).decode("ascii")
-                    self._messages.append({
-                        "role": "tool",
-                        "tool_call_id": tr.call_id,
-                        "content": "Image loaded. See next message.",
-                    })
-                    pending_image_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                    })
+                    if self._supports_vision():
+                        image_data, mime_type = tr.content
+                        b64 = base64.b64encode(image_data).decode("ascii")
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": tr.call_id,
+                            "content": "Image loaded. See next message.",
+                        })
+                        pending_image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                        })
+                    else:
+                        image_data, mime_type = tr.content
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": tr.call_id,
+                            "content": f"Image ({mime_type}, {len(image_data)} bytes) — vision not supported by {self._model}. Use bash: file, xxd, strings.",
+                        })
                 else:
                     self._messages.append({
                         "role": "tool",
@@ -77,6 +93,7 @@ class ZAISession(SolverSession):
         elif message:
             self._messages.append({"role": "user", "content": message})
 
+        context_injected = False
         if self._pending_context:
             if self._messages:
                 last = self._messages[-1]
@@ -88,22 +105,29 @@ class ZAISession(SolverSession):
             else:
                 self._messages.append({"role": "user", "content": self._pending_context})
             self._pending_context = None
+            context_injected = True
 
         body: dict[str, Any] = {
             "model": self._model,
-            "messages": self._messages,
+            "messages": list(self._messages),
             "max_tokens": 16384,
         }
         if self._tools:
             body["tools"] = self._tools
 
         client = self._get_client()
-        resp = await client.post(
-            f"{self._endpoint}/chat/completions",
-            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-            json=body,
-        )
-        resp.raise_for_status()
+        try:
+            resp = await client.post(
+                f"{self._endpoint}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                json=body,
+            )
+            resp.raise_for_status()
+        except Exception:
+            del self._messages[n_before:]
+            if context_injected:
+                self._pending_context = None
+            raise
         data = resp.json()
 
         choice = data["choices"][0]

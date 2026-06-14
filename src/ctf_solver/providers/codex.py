@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
 
 from ctf_solver.providers.base import (
     ProviderBase,
@@ -129,7 +131,7 @@ class CodexSession(SolverSession):
         self._msg_id = 0
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._tool_request_ids: dict[str, int] = {}
-        self._tool_call_queue: asyncio.Queue[ToolCall] = asyncio.Queue()
+        self._tool_call_queue: asyncio.Queue[ToolCall | None] = asyncio.Queue()
         self._text_buffer: str = ""
         self._usage: TokenUsage = TokenUsage()
         self._read_task: asyncio.Task | None = None
@@ -137,12 +139,16 @@ class CodexSession(SolverSession):
         self._pending_context: str | None = None
 
     async def _start_process(self) -> None:
+        env = {**os.environ}
+        if self._config.get("openai_api_key"):
+            env["OPENAI_API_KEY"] = self._config["openai_api_key"]
         self._proc = await asyncio.create_subprocess_exec(
             "codex",
             "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
         self._read_task = asyncio.create_task(self._read_loop())
         await self._rpc(
@@ -159,7 +165,7 @@ class CodexSession(SolverSession):
                 "model": self._config.get("codex_model", "gpt-5.4"),
                 "personality": "pragmatic",
                 "baseInstructions": self._system_prompt,
-                "cwd": "/challenge",
+                "cwd": ".",
                 "approvalPolicy": "on-request",
                 "sandbox": "read-only",
                 "dynamicTools": SANDBOX_TOOLS,
@@ -198,11 +204,18 @@ class CodexSession(SolverSession):
         self._proc.stdin.write((json.dumps(response) + "\n").encode())
         await self._proc.stdin.drain()
 
+    def _wake_pending_on_eof(self) -> None:
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(RuntimeError("Codex process exited unexpectedly"))
+        self._pending_responses.clear()
+
     async def _read_loop(self) -> None:
         try:
             while self._proc and self._proc.stdout:
                 line = await self._proc.stdout.readline()
                 if not line:
+                    self._wake_pending_on_eof()
                     break
                 try:
                     msg = json.loads(line.decode())
@@ -247,6 +260,7 @@ class CodexSession(SolverSession):
                         self._text_buffer = text
                     elif method == "turn/completed":
                         self._turn_done_event.set()
+                        await self._tool_call_queue.put(None)
                     elif method == "thread/tokenUsage/updated":
                         usage = params.get("tokenUsage", {}).get("last", {})
                         self._usage = TokenUsage(
@@ -258,49 +272,75 @@ class CodexSession(SolverSession):
             pass
         except Exception as e:
             logger.warning("Codex read loop error: %s", e)
+            self._wake_pending_on_eof()
 
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
         if not self._proc:
             await self._start_process()
 
         if tool_results:
+            # Reply to the model's pending tool-call requests. The turn is still
+            # active, so we fall through to the shared drain loop below to read
+            # the model's next output. Returning here (as before) would hand the
+            # swarm an empty tool_calls list and end the solver after one round.
             for tr in tool_results:
-                content = tr.content if isinstance(tr.content, str) else "Binary/image result"
+                content_items: list[dict] = []
+                if isinstance(tr.content, tuple):
+                    image_data, mime_type = tr.content
+                    b64 = base64.b64encode(image_data).decode("ascii")
+                    content_items.append({"type": "inputImage", "image": {"url": f"data:{mime_type};base64,{b64}"}})
+                    content_items.append({"type": "inputText", "text": f"Image ({mime_type}, {len(image_data)} bytes)"})
+                else:
+                    content_items.append({"type": "inputText", "text": tr.content})
                 request_id = self._tool_request_ids.pop(tr.call_id, None)
                 if request_id is not None:
                     await self._send_rpc_response(request_id, {
-                        "contentItems": [{"type": "inputText", "text": content}],
+                        "contentItems": content_items,
                         "success": tr.error is None,
                     })
                 else:
                     logger.warning("No stored request id for tool call %s", tr.call_id)
-            return SolverResponse(text="", tool_calls=[], usage=self._usage, done=False)
+            # The turn is still active: reset turn state so the shared drain waits
+            # for the model's next batch instead of seeing the prior turn/completed.
+            self._text_buffer = ""
+            self._turn_done_event.clear()
+        else:
+            # New user input (or injected context) starts a fresh turn.
+            prompt_text = message
+            if self._pending_context:
+                prompt_text += f"\n\n{self._pending_context}"
+                self._pending_context = None
 
-        prompt_text = message
-        if self._pending_context:
-            prompt_text += f"\n\n{self._pending_context}"
-            self._pending_context = None
+            self._text_buffer = ""
+            self._turn_done_event.clear()
+            await self._rpc(
+                "turn/start",
+                {
+                    "threadId": self._thread_id,
+                    "input": [{"type": "text", "text": prompt_text}],
+                },
+            )
 
-        self._text_buffer = ""
-        self._turn_done_event.clear()
-        await self._rpc(
-            "turn/start",
-            {
-                "threadId": self._thread_id,
-                "input": [{"type": "text", "text": prompt_text}],
-            },
-        )
-
-        tool_calls: list[ToolCall] = []
-        while not self._turn_done_event.is_set():
-            try:
-                tc = await asyncio.wait_for(self._tool_call_queue.get(), timeout=1.0)
-                tool_calls.append(tc)
-            except TimeoutError:
-                continue
-
+        tool_calls = await self._drain_turn()
         done = not tool_calls
         return SolverResponse(text=self._text_buffer, tool_calls=tool_calls, usage=self._usage, done=done)
+
+    async def _drain_turn(self) -> list[ToolCall]:
+        """Read queued items until the model emits a tool-call batch or the turn
+        completes. Shared by the new-turn and tool-result continuation paths."""
+        tool_calls: list[ToolCall] = []
+        while not self._turn_done_event.is_set():
+            item = await self._tool_call_queue.get()
+            if item is None:
+                break
+            tool_calls.append(item)
+        # If turn/completed landed before/while we drained, sweep any tool calls
+        # queued ahead of the None sentinel so they are not stranded (TOCTOU).
+        while not self._tool_call_queue.empty():
+            item = self._tool_call_queue.get_nowait()
+            if item is not None:
+                tool_calls.append(item)
+        return tool_calls
 
     async def inject_context(self, text: str) -> None:
         self._pending_context = text

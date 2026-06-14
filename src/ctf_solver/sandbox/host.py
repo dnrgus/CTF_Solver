@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 import tempfile
 from pathlib import Path
 
 from ctf_solver.sandbox import ExecResult
+
+_BLOCKED_PATH_PREFIXES = ("/etc/", "/proc/", "/sys/", "/dev/", "/root/", "/boot/")
 
 
 class HostSandbox:
@@ -40,14 +43,26 @@ class HostSandbox:
             return self._workspace_path
         p = Path(path)
         if p.is_absolute():
+            abs_str = str(p)
+            for prefix in _BLOCKED_PATH_PREFIXES:
+                if abs_str.startswith(prefix):
+                    raise ValueError(f"Access to system path blocked: {path}")
             return p
         return Path(self.challenge_dir) / path
 
     def _rewrite_command_paths(self, command: str) -> str:
-        command = command.replace("/challenge/distfiles", shlex.quote(str(self._distfiles_dir)))
-        command = command.replace("/challenge/workspace", shlex.quote(str(self._workspace_path)))
-        command = command.replace("/challenge", shlex.quote(self.challenge_dir))
-        return command
+        replacements = [
+            ("/challenge/distfiles", shlex.quote(str(self._distfiles_dir))),
+            ("/challenge/workspace", shlex.quote(str(self._workspace_path))),
+            ("/challenge", shlex.quote(self.challenge_dir)),
+        ]
+        def _replace_match(m: re.Match) -> str:
+            matched = m.group(0)
+            for old, new in replacements:
+                if matched == old:
+                    return new
+            return matched
+        return re.sub(r"/challenge(?:/distfiles|/workspace)?(?=/|\s|$)", _replace_match, command)
 
     async def start(self) -> None:
         self._workspace_dir = tempfile.mkdtemp(prefix="ctf-host-workspace-")

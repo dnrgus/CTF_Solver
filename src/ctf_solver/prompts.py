@@ -51,6 +51,73 @@ def _rewrite_connection_info(conn: str) -> str:
     return conn
 
 
+# Tactical first-moves per category — injected to prime the right approach.
+CATEGORY_PLAYBOOK: dict[str, list[str]] = {
+    "pwn": [
+        "Run `checksec` and `file`; note arch and RELRO/canary/NX/PIE.",
+        "Disassemble (objdump -d, radare2, pwntools) and find the vulnerable function.",
+        "Build the exploit with pwntools and test locally before the remote service.",
+        "Usual bugs: stack overflow, format string, off-by-one, UAF, integer overflow.",
+    ],
+    "rev": [
+        "Triage with `file`, `strings`, `nm`; spot packers, language, embedded data.",
+        "Decompile (radare2, objdump, pyghidra) and locate the check gating the flag.",
+        "Look for hardcoded comparisons, XOR/encode routines, or a serial/keygen check.",
+        "Use ltrace/strace or a debugger to observe runtime behavior.",
+    ],
+    "crypto": [
+        "Identify the scheme (RSA, AES, XOR, classical) from the source/params first.",
+        "RSA: check small e, shared modulus, Wiener, factorable n (RsaCtfTool, sympy).",
+        "Hunt for nonce/key reuse, ECB patterns, and weak/predictable randomness.",
+        "Implement the attack with python3 + pycryptodome / sympy / z3.",
+    ],
+    "web": [
+        "Map the app: `curl -i` endpoints, read HTML/JS, inspect cookies and headers.",
+        "Test SQLi, SSTI, XSS, IDOR, path traversal, auth bypass, SSRF.",
+        "Use webhook_create for out-of-band (blind SSRF/XXE/OOB) confirmation.",
+        "Check robots.txt, /.git, backups, and source-disclosure leaks.",
+    ],
+    "forensics": [
+        "Identify the artifact: `file`, `binwalk`, `exiftool`, `strings`.",
+        "pcap → tshark; memory → volatility3; disk → sleuthkit/foremost.",
+        "Carve embedded files, follow streams, reassemble fragments.",
+    ],
+    "stego": [
+        "Start broad: `strings`, `exiftool`, `binwalk`, `xxd` on the media.",
+        "Images: zsteg (PNG/BMP), steghide/stegseek (JPG), LSB and channel splits.",
+        "Audio: inspect spectrograms; always check metadata and appended data.",
+    ],
+    "misc": [
+        "Enumerate first: `file`, `strings`, `xxd`; identify encodings (base64/hex/rot).",
+        "Decode layer by layer with python3; chained encodings are common.",
+        "Watch for jails/sandboxes, esolangs, QR/barcodes, and protocol puzzles.",
+    ],
+}
+
+_CATEGORY_ALIASES = {
+    "reversing": "rev",
+    "reverse": "rev",
+    "re": "rev",
+    "binary": "pwn",
+    "binexp": "pwn",
+    "exploitation": "pwn",
+    "cryptography": "crypto",
+    "steganography": "stego",
+    "forensic": "forensics",
+}
+
+
+def _category_tips(category: str) -> list[str]:
+    cat = (category or "").lower()
+    for key, tips in CATEGORY_PLAYBOOK.items():
+        if key and (key in cat or cat == key):
+            return tips
+    for alias, key in _CATEGORY_ALIASES.items():
+        if alias == cat:
+            return CATEGORY_PLAYBOOK[key]
+    return []
+
+
 def build_prompt(
     meta: ChallengeMeta,
     distfile_names: list[str],
@@ -99,15 +166,29 @@ def build_prompt(
 
     lines += [
         "",
-        "## Instructions",
-        "**Use tools immediately. Do not describe — execute.**",
+        "## Environment",
+        "- You act through tools; `bash` runs inside an isolated sandbox container.",
+        "- Files: `/challenge/distfiles/` (read-only). Scratch space: `/challenge/workspace/` (writable).",
+        "- Other solver agents run in parallel — call `check_findings` to pull their insights.",
         "",
-        "1. Start working now.",
-        "2. Keep using tools until you have the flag.",
-        "3. Be creative and thorough.",
-        "4. Ignore placeholder flags like CTF{flag}, CTF{placeholder}.",
-        "5. Verify every candidate with submit_flag.",
-        "6. Once confirmed: output `FLAG: <value>` on its own line.",
+    ]
+
+    tips = _category_tips(meta.category)
+    if tips:
+        lines.append(f"## Strategy ({meta.category})")
+        lines += [f"- {t}" for t in tips]
+        lines.append("")
+
+    lines += [
+        "## Method",
+        "**Act now — use tools instead of describing what you would do.**",
+        "",
+        "1. **Enumerate first** — inspect files/service before theorizing (`file`, `strings`, `ls`).",
+        "2. Form a hypothesis, then test it with one concrete tool call at a time; read each result.",
+        "3. If a technique fails twice, **change approach** — do not repeat identical commands.",
+        "4. Recover the flag, then verify it with `submit_flag` (it checks the pattern locally).",
+        "5. Ignore placeholder flags like `CTF{flag}` or `FLAG{placeholder}`.",
+        "6. Once you have the real flag, output `FLAG: <value>` on its own line.",
     ]
 
     return "\n".join(lines)

@@ -1,0 +1,31 @@
+# Challenge metadata — parsed by ctf_solver.prompts.ChallengeMeta.from_yaml
+# Schema fields: name, category, value, description, tags, connection_info, hints
+# Only `description` here feeds the solver prompt; if you set --challenge-dir
+# WITHOUT a description.txt, this `description` is used instead. With a
+# description.txt present, the CLI prefers description.txt (it is checked first),
+# and this file still supplies the category hint when --category is omitted.
+
+name: "Layer Cake"
+category: "misc"
+value: 50
+
+description: |
+  An intern swore this file was "encrypted." It isn't — it's just a couple of
+  common encodings stacked on top of each other. Peel the outer base64 layer
+  (A-Z a-z 0-9 + / with a = pad) to reveal an inner layer of hex (0-9 a-f),
+  then decode that to printable ASCII. The flag looks like FLAG{...}. No key,
+  no brute force — base64, xxd, and python3 are enough.
+
+tags:
+  - encoding
+  - base64
+  - hex
+  - beginner
+
+# No remote service for this challenge — everything is in distfiles/.
+connection_info: ""
+
+hints:
+  - "The outer alphabet (A-Z a-z 0-9 + / =) screams base64. Decode it first."
+  - "What's left is pure hex — pairs of 0-9/a-f. `xxd -r -p` turns hex back into bytes."
+  - "It's encoding, not encryption: every step is reversible with no secret."

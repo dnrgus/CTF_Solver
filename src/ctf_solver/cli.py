@@ -41,27 +41,27 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--challenge-dir", default=None, help="Challenge directory")
 @click.option("--files", multiple=True, help="Individual challenge files")
 @click.option("--desc", default=None, help="Challenge description (required with --files)")
-@click.option("--category", default="", help="Category hint")
-@click.option("--claude", "claude_count", default=0, type=int, help="Number of Claude solvers")
-@click.option("--codex", "codex_count", default=0, type=int, help="Number of Codex solvers")
-@click.option("--zai", "zai_count", default=0, type=int, help="Number of z.ai solvers")
+@click.option("--category", default=None, help="Category hint")
+@click.option("--claude", "claude_count", default=None, type=int, help="Number of Claude solvers")
+@click.option("--codex", "codex_count", default=None, type=int, help="Number of Codex solvers")
+@click.option("--zai", "zai_count", default=None, type=int, help="Number of z.ai solvers")
 @click.option("--coordinator", default=None, help="Coordinator provider")
 @click.option("--no-coordinator", is_flag=True, help="Disable coordinator")
-@click.option("--timeout", default=600, type=int, help="Max seconds per challenge")
-@click.option("--max-steps", default=100, type=int, help="Max tool calls per solver")
-@click.option("--max-cost", default=10.0, type=float, help="Max USD cost")
+@click.option("--timeout", default=None, type=int, help="Max seconds per challenge")
+@click.option("--max-steps", default=None, type=int, help="Max tool calls per solver")
+@click.option("--max-cost", default=None, type=float, help="Max USD cost")
 @click.option("--flag-pattern", default=None, help="Regex for flag extraction")
-@click.option("--hint", default="", help="Pre-inject hint")
+@click.option("--hint", default=None, help="Pre-inject hint")
 @click.option("--interactive", is_flag=True, help="Enable stdin hint input")
-@click.option("--sandbox-image", default="ctf-sandbox", help="Docker image")
-@click.option("--sandbox-memory", default="4g", help="Memory limit per container")
-@click.option("--sandbox-cpus", default=2, type=int, help="CPU limit per container")
+@click.option("--sandbox-image", default=None, help="Docker image")
+@click.option("--sandbox-memory", default=None, help="Memory limit per container")
+@click.option("--sandbox-cpus", default=None, type=int, help="CPU limit per container")
 @click.option("--no-docker", is_flag=True, help="Run on host (debug)")
-@click.option("--output-dir", default="", help="Output directory")
-@click.option("--log-dir", default="", help="Log directory")
+@click.option("--output-dir", default=None, help="Output directory")
+@click.option("--log-dir", default=None, help="Log directory")
 @click.option("--no-tui", is_flag=True, help="CLI mode only")
 @click.option("--dry-run", is_flag=True, help="Show config without executing")
-@click.option("--port", default=0, type=int, help="Hint endpoint port (0=auto)")
+@click.option("--port", default=None, type=int, help="Hint endpoint port (0=auto)")
 @click.option("--verbose", is_flag=True, help="Debug logging")
 @click.option("--resume", default=None, help="Resume from previous session log dir")
 @click.option("--config", default=None, help="TOML config file")
@@ -69,33 +69,35 @@ def main(
     challenge_dir: str | None,
     files: tuple[str, ...],
     desc: str | None,
-    category: str,
-    claude_count: int,
-    codex_count: int,
-    zai_count: int,
+    category: str | None,
+    claude_count: int | None,
+    codex_count: int | None,
+    zai_count: int | None,
     coordinator: str | None,
     no_coordinator: bool,
-    timeout: int,
-    max_steps: int,
-    max_cost: float,
+    timeout: int | None,
+    max_steps: int | None,
+    max_cost: float | None,
     flag_pattern: str | None,
-    hint: str,
+    hint: str | None,
     interactive: bool,
-    sandbox_image: str,
-    sandbox_memory: str,
-    sandbox_cpus: int,
+    sandbox_image: str | None,
+    sandbox_memory: str | None,
+    sandbox_cpus: int | None,
     no_docker: bool,
-    output_dir: str,
-    log_dir: str,
+    output_dir: str | None,
+    log_dir: str | None,
     no_tui: bool,
     dry_run: bool,
-    port: int,
+    port: int | None,
     verbose: bool,
     resume: str | None,
     config: str | None,
 ) -> None:
     """CTF Solver Agent — multi-model solver swarm."""
     _setup_logging(verbose)
+
+    defaults = Settings()
 
     if config:
         toml_data = load_toml_config(config)
@@ -118,11 +120,22 @@ def main(
             env_overrides["ZAI_MODEL"] = models["zai_model"]
         if "zai_endpoint" in models:
             env_overrides["ZAI_ENDPOINT"] = models["zai_endpoint"]
+        toml_settings = toml_data.get("settings", {})
         import os
 
         for k, v in env_overrides.items():
             os.environ.setdefault(k, v)
 
+        defaults = Settings()
+
+    _timeout = timeout if timeout is not None else int(toml_settings.get("timeout", defaults.timeout)) if config else (timeout if timeout is not None else defaults.timeout)
+    _max_steps = max_steps if max_steps is not None else int(toml_settings.get("max_steps", defaults.max_steps)) if config else (max_steps if max_steps is not None else defaults.max_steps)
+    _max_cost = max_cost if max_cost is not None else float(toml_settings.get("max_cost", defaults.max_cost)) if config else (max_cost if max_cost is not None else defaults.max_cost)
+    _claude_count = claude_count if claude_count is not None else int(toml_settings.get("claude_count", defaults.claude_count)) if config else (claude_count if claude_count is not None else defaults.claude_count)
+    _codex_count = codex_count if codex_count is not None else int(toml_settings.get("codex_count", defaults.codex_count)) if config else (codex_count if codex_count is not None else defaults.codex_count)
+    _zai_count = zai_count if zai_count is not None else int(toml_settings.get("zai_count", defaults.zai_count)) if config else (zai_count if zai_count is not None else defaults.zai_count)
+
+    resume_state: SessionState | None = None
     if resume:
         try:
             prev = SessionState.load(resume)
@@ -136,7 +149,20 @@ def main(
         if prev.confirmed_flag:
             console.print(f"\n[bold green]FLAG ALREADY FOUND: {prev.confirmed_flag} (by {prev.winner_id})[/bold green]")
             return
-        console.print("\n[yellow]No flag found previously. Re-launching...[/yellow]")
+        console.print("\n[yellow]No flag found previously. Resuming the same challenge...[/yellow]")
+        # Make --resume self-sufficient: reuse the prior challenge unless overridden.
+        if not challenge_dir and not files:
+            if Path(prev.challenge_dir).is_dir():
+                challenge_dir = prev.challenge_dir
+            else:
+                console.print(
+                    f"[red]Prior challenge dir missing: {prev.challenge_dir}. "
+                    "Pass --challenge-dir to resume.[/red]"
+                )
+                sys.exit(1)
+        if not category:
+            category = prev.category
+        resume_state = prev
 
     if not no_tui and not sys.stdout.isatty():
         no_tui = True
@@ -154,26 +180,26 @@ def main(
         sys.exit(1)
 
     settings = Settings(
-        claude_count=claude_count,
-        codex_count=codex_count,
-        zai_count=zai_count,
+        claude_count=_claude_count,
+        codex_count=_codex_count,
+        zai_count=_zai_count,
         coordinator=coordinator or "",
         no_coordinator=no_coordinator,
-        timeout=timeout,
-        max_steps=max_steps,
-        max_cost=max_cost,
+        timeout=_timeout,
+        max_steps=_max_steps,
+        max_cost=_max_cost,
         flag_pattern=flag_pattern or Settings.model_fields["flag_pattern"].default,
-        hint=hint,
+        hint=hint or "",
         interactive=interactive,
-        sandbox_image=sandbox_image,
-        sandbox_memory=sandbox_memory,
-        sandbox_cpus=sandbox_cpus,
+        sandbox_image=sandbox_image or defaults.sandbox_image,
+        sandbox_memory=sandbox_memory or defaults.sandbox_memory,
+        sandbox_cpus=sandbox_cpus if sandbox_cpus is not None else defaults.sandbox_cpus,
         no_docker=no_docker,
-        output_dir=output_dir,
-        log_dir=log_dir,
+        output_dir=output_dir or "",
+        log_dir=log_dir or "",
         no_tui=no_tui,
         dry_run=dry_run,
-        port=port,
+        port=port if port is not None else defaults.port,
         verbose=verbose,
     )
 
@@ -189,10 +215,10 @@ def main(
         coord = None
 
     console.print("[bold]CTF Solver Agent[/bold]")
-    console.print(f"  Providers: claude={claude_count}, codex={codex_count}, zai={zai_count}")
+    console.print(f"  Providers: claude={settings.claude_count}, codex={settings.codex_count}, zai={settings.zai_count}")
     console.print(f"  Coordinator: {coord or 'disabled'}")
-    console.print(f"  Sandbox: {sandbox_image} ({sandbox_memory}, {sandbox_cpus} CPUs)")
-    console.print(f"  Limits: {timeout}s, {max_steps} steps, ${max_cost:.2f}")
+    console.print(f"  Sandbox: {settings.sandbox_image} ({settings.sandbox_memory}, {settings.sandbox_cpus} CPUs)")
+    console.print(f"  Limits: {settings.timeout}s, {settings.max_steps} steps, ${settings.max_cost:.2f}")
 
     if dry_run:
         console.print("\n[green]DRY RUN — configuration valid.[/green]")
@@ -232,9 +258,10 @@ def main(
         challenge_dir=chall_dir,
         challenge_name=Path(chall_dir).name,
         description=desc or "",
-        category=category,
+        category=category or "",
         settings=settings,
         event_bus=event_bus,
+        resume_state=resume_state,
     )
 
     swarm_ref = [swarm]
@@ -268,13 +295,13 @@ def main(
     else:
         from ctf_solver.tui.app import CTFApp
 
-        app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name, max_cost=max_cost)
+        app = CTFApp(event_bus=event_bus, challenge_name=Path(chall_dir).name, max_cost=settings.max_cost, category=category)
 
         async def run_with_tui() -> object:
             from ctf_solver.hint_server import start_hint_server
             from ctf_solver.writeup import generate_writeup
 
-            hint_server, hint_port = await start_hint_server(event_bus, port)
+            hint_server, hint_port = await start_hint_server(event_bus, settings.port)
             console.print(f"  Hint endpoint: port {hint_port}")
             console.print(f"  Use: ctf-msg --port {hint_port} \"your hint\"")
 
@@ -293,16 +320,30 @@ def main(
                 await coordinator.start()
 
             swarm_task = asyncio.create_task(swarm.run())
-            await app.run_async()
+            tui_task = asyncio.create_task(app.run_async())
+
+            done, pending = await asyncio.wait(
+                [swarm_task, tui_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
             swarm.kill()
             if coordinator:
                 await coordinator.stop()
             hint_server.close()
             await hint_server.wait_closed()
-            result = await swarm_task
+            result = None
+            if swarm_task in done:
+                try:
+                    result = swarm_task.result()
+                except Exception:
+                    result = None
             if result:
                 generate_writeup(
-                    output_dir or chall_dir, Path(chall_dir).name, category, result,
+                    settings.output_dir or chall_dir, Path(chall_dir).name, category or "", result,
                     total_cost_usd=swarm.cost_tracker.total_cost_usd,
                     total_solvers=len(swarm.solvers),
                 )

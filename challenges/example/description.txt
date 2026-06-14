@@ -1,0 +1,13 @@
+An intern swore this file was "encrypted" before they left. It isn't — it's
+just been run through a couple of common encodings, one stacked on top of the
+other.
+
+We pulled the blob out of a chat log and saved it as cipher.txt. The character
+set is the giveaway for the outer layer: only A-Z, a-z, 0-9, + and / with a
+trailing = pad. Peel that off and you'll be staring at the next layer, which is
+shorter and made up entirely of the digits 0-9 and the letters a-f.
+
+Strip the encodings layer by layer until you reach printable ASCII. The flag
+looks like FLAG{...}.
+
+Tools like base64, xxd, and python3 are all you need — no key, no brute force.

@@ -53,6 +53,7 @@ class ClaudeSession(SolverSession):
         return self._client
 
     async def send(self, message: str, tool_results: list[ToolResult] | None = None) -> SolverResponse:
+        n_before = len(self._messages)
         if tool_results:
             content_blocks = []
             for tr in tool_results:
@@ -68,6 +69,7 @@ class ClaudeSession(SolverSession):
         elif message:
             self._messages.append({"role": "user", "content": message})
 
+        context_injected = False
         if self._pending_context:
             if self._messages and self._messages[-1].get("role") == "user":
                 last = self._messages[-1]
@@ -78,27 +80,34 @@ class ClaudeSession(SolverSession):
             else:
                 self._messages.append({"role": "user", "content": self._pending_context})
             self._pending_context = None
+            context_injected = True
 
         body: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 16384,
             "system": self._system_prompt,
-            "messages": self._messages,
+            "messages": list(self._messages),
         }
         if self._tools:
             body["tools"] = self._tools
 
         client = self._get_client()
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": self._api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=body,
-        )
-        resp.raise_for_status()
+        try:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self._api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+        except Exception:
+            del self._messages[n_before:]
+            if context_injected:
+                self._pending_context = None
+            raise
         data = resp.json()
 
         text_parts: list[str] = []

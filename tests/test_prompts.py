@@ -59,3 +59,20 @@ def test_list_distfiles(tmp_path):
 
 def test_list_distfiles_no_dir(tmp_path):
     assert list_distfiles(str(tmp_path)) == []
+
+
+def test_build_prompt_includes_category_strategy():
+    meta = ChallengeMeta(name="x", category="crypto", description="d")
+    prompt = build_prompt(meta, [])
+    assert "Strategy (crypto)" in prompt
+    assert "RSA" in prompt
+
+
+def test_category_tips_alias_is_exact_match():
+    from ctf_solver.prompts import _category_tips
+
+    # 'forensic' (singular) must resolve to forensics, not reversing — the old
+    # substring match let the 're' alias match inside 'forensic'.
+    assert _category_tips("forensic") == _category_tips("forensics")
+    assert "volatility3" in " ".join(_category_tips("forensic"))
+    assert _category_tips("totallyunknown") == []

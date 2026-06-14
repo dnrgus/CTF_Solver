@@ -2,18 +2,61 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+try:
+    from genai_prices import Usage as _GPUsage
+    from genai_prices import calc_price as _gp_calc_price
+
+    _GENAI_PRICES_AVAILABLE = True
+except ImportError:  # pragma: no cover - dependency is declared, guard is defensive
+    _GENAI_PRICES_AVAILABLE = False
 
 FALLBACK_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": {"input": 5.00, "cached_input": 0.50, "output": 25.00},
+    "claude-opus-4-6-20250612": {"input": 5.00, "cached_input": 0.50, "output": 25.00},
     "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
     "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
     "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
+    "glm-5.1": {"input": 0.0, "cached_input": 0.0, "output": 0.0},
 }
 
 
 def _calc_cost(input_tokens: int, output_tokens: int, cache_read_tokens: int, model: str) -> float:
+    """Price a call. Prefer the genai-prices DB; fall back to the local table.
+
+    genai-prices treats ``input_tokens`` as the total prompt size with
+    ``cache_read_tokens`` a discounted subset of it — the same convention this
+    tracker uses — so the token fields pass through unchanged.
+    """
+    if _GENAI_PRICES_AVAILABLE and model:
+        try:
+            price = _gp_calc_price(
+                _GPUsage(
+                    input_tokens=input_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    output_tokens=output_tokens,
+                ),
+                model_ref=model,
+            )
+            return float(price.total_price)
+        except Exception:  # unknown model / lookup failure → local table
+            pass
+    return _calc_cost_fallback(input_tokens, output_tokens, cache_read_tokens, model)
+
+
+def _calc_cost_fallback(input_tokens: int, output_tokens: int, cache_read_tokens: int, model: str) -> float:
+    if not model:
+        return 0.0
     pricing = FALLBACK_PRICING.get(model)
+    if not pricing:
+        for key, val in FALLBACK_PRICING.items():
+            if model.startswith(key) or key.startswith(model):
+                pricing = val
+                break
     if not pricing:
         return 0.0
     input_rate = pricing["input"]

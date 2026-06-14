@@ -11,7 +11,7 @@ from pathlib import Path
 import aiodocker
 
 from ctf_solver.collaboration.loop_detect import LOOP_WARNING_MESSAGE, LoopDetector
-from ctf_solver.collaboration.message_bus import ChallengeMessageBus
+from ctf_solver.collaboration.message_bus import ChallengeMessageBus, InsightMessage
 from ctf_solver.config import Settings, get_active_providers
 from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.prompts import ChallengeMeta, build_prompt, list_distfiles
@@ -172,6 +172,8 @@ class ChallengeSwarm:
     _submitted_flags: set[str] = field(default_factory=set)
     _circuit_breakers: dict[str, CircuitBreaker] = field(default_factory=dict)
     session_state: SessionState | None = None
+    resume_state: SessionState | None = None
+    _results: dict[str, ResultStatus] = field(default_factory=dict)
 
     def _check_cooldown(self, inst: SolverInstance) -> tuple[bool, str]:
         """Check if solver is in cooldown. Returns (is_cooled_down, message)."""
@@ -188,6 +190,56 @@ class ChallengeSwarm:
     def _record_wrong_submit(self, inst: SolverInstance) -> None:
         inst._wrong_submit_count += 1
         inst._last_submit_time = time.monotonic()
+
+    async def _handle_flag_candidate(
+        self, inst: SolverInstance, flag: str, *, penalize: bool = True
+    ) -> tuple[str, bool]:
+        """Validate and record one flag candidate.
+
+        Shared by the explicit ``submit_flag`` tool and the regex text-scan path
+        so dedup, winner-lock, event publication and message-bus sharing behave
+        identically regardless of how the candidate surfaced. ``penalize`` is
+        True for deliberate tool submissions (apply the escalating cooldown and
+        count wrong tries) and False for passive scans of assistant text — a flag
+        merely *mentioned* while reasoning must not block the next real submit.
+        Returns ``(message, is_valid)``; the regex path ignores the message.
+        """
+        flag = flag.strip()
+        if not flag:
+            return "Empty flag — nothing to validate.", False
+        if flag in self._submitted_flags:
+            return "Already tried this flag.", False
+        if not extract_flags(flag, self.settings.flag_pattern):
+            return f"Flag '{flag}' does not match expected pattern.", False
+
+        # Deliberate submissions are subject to the escalating cooldown.
+        if penalize:
+            cooled, cooldown_msg = self._check_cooldown(inst)
+            if not cooled:
+                return cooldown_msg, False
+
+        result, is_valid = await do_submit_flag(
+            flag, self.settings.flag_pattern, self._submitted_flags,
+            accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
+        )
+        self.event_bus.publish(SolverEvent(
+            type="flag_candidate", solver_id=inst.solver_id,
+            data={"flag": flag, "verified": is_valid},
+        ))
+        await self.message_bus.post(InsightMessage(
+            solver_id=inst.solver_id, step=inst.step_count, category="flag_candidate",
+            content=f"Candidate flag: {flag}", confidence=0.9 if is_valid else 0.4,
+        ))
+        if is_valid:
+            inst.flag = flag
+            inst.confirmed = True
+            async with self._flag_lock:
+                if not self.confirmed_flag:
+                    self.confirmed_flag = flag
+                    self.winner_id = inst.solver_id
+        elif penalize:
+            self._record_wrong_submit(inst)
+        return result, is_valid
 
     def _create_circuit_breakers(self) -> dict[str, CircuitBreaker]:
         return {name: CircuitBreaker() for name, _ in get_active_providers(self.settings)}
@@ -224,9 +276,33 @@ class ChallengeSwarm:
                 instances.append(instance)
         return instances
 
+    def _apply_resume_state(self, instances: list[SolverInstance]) -> list[SolverInstance]:
+        """Carry the winner/flag forward and drop solvers that already solved.
+
+        A prior SOLVED solver means the challenge was already cracked, so its
+        flag is kept and it is not re-run; every other solver is retried."""
+        prev = self.resume_state
+        if not prev:
+            return instances
+        self.confirmed_flag = prev.confirmed_flag
+        self.winner_id = prev.winner_id
+        solved = {s.solver_id for s in prev.solvers if s.status == ResultStatus.SOLVED.value}
+        remaining: list[SolverInstance] = []
+        for inst in instances:
+            if inst.solver_id in solved:
+                prior = next(s for s in prev.solvers if s.solver_id == inst.solver_id)
+                inst.flag = prior.flag
+                inst.confirmed = True
+                self._results[inst.solver_id] = ResultStatus.SOLVED
+                self.solvers[inst.solver_id] = inst
+                logger.info("[%s] Skipping — already solved in prior session", inst.solver_id)
+            else:
+                remaining.append(inst)
+        return remaining
+
     async def run(self) -> SolverResult | None:
         self._circuit_breakers = self._create_circuit_breakers()
-        instances = self._create_solvers()
+        instances = self._apply_resume_state(self._create_solvers())
         for inst in instances:
             self.solvers[inst.solver_id] = inst
             self.event_bus.publish(SolverEvent(type="solver_started", solver_id=inst.solver_id, data={"provider": inst.provider_name}))
@@ -249,6 +325,8 @@ class ChallengeSwarm:
                     except Exception:
                         logger.warning("Solver task failed", exc_info=True)
                         continue
+                    if result:
+                        self._results[result.solver_id] = result.status
                     self._update_session_state()
                     if result and result.status == ResultStatus.SOLVED:
                         self._update_session_state()
@@ -274,6 +352,19 @@ class ChallengeSwarm:
             self._save_session_state()
 
     async def _init_solver(self, inst: SolverInstance, t0: float) -> SolverResult | None:
+        provider = get_provider(inst.provider_name)
+        config = self.settings.to_provider_config()
+
+        if not provider.validate_config(config):
+            return SolverResult(
+                solver_id=inst.solver_id,
+                status=ResultStatus.ERROR,
+                flag=None,
+                steps=0,
+                duration=time.monotonic() - t0,
+                error=f"Provider {inst.provider_name} not configured",
+            )
+
         if not self.settings.no_docker:
             docker = aiodocker.Docker()
             try:
@@ -295,19 +386,6 @@ class ChallengeSwarm:
 
         await inst.sandbox.start()
         self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
-
-        provider = get_provider(inst.provider_name)
-        config = self.settings.to_provider_config()
-
-        if not provider.validate_config(config):
-            return SolverResult(
-                solver_id=inst.solver_id,
-                status=ResultStatus.ERROR,
-                flag=None,
-                steps=0,
-                duration=time.monotonic() - t0,
-                error=f"Provider {inst.provider_name} not configured",
-            )
 
         log_dir = self.settings.log_dir or "logs"
         inst.tracer = SolverTracer(self.challenge_name, inst.provider_name, log_dir=log_dir)
@@ -351,10 +429,25 @@ class ChallengeSwarm:
                 break
 
             if inst.step_count > 0 and inst.step_count % 5 == 0:
+                # Share this solver's latest reasoning with siblings...
+                if inst.findings:
+                    await self.message_bus.post(InsightMessage(
+                        solver_id=inst.solver_id, step=inst.step_count,
+                        category="finding", content=inst.findings[:500],
+                    ))
+                    self.event_bus.publish(SolverEvent(
+                        type="insight_shared", solver_id=inst.solver_id,
+                        data={"content": inst.findings[:200]},
+                    ))
+                # ...and pull in what the others have shared.
                 insights_text = await do_check_findings(self.message_bus, inst.solver_id)
                 if insights_text and "No new findings" not in insights_text:
                     await inst.session.inject_context(insights_text)
                     inst.loop_detector.reset()
+                    self.event_bus.publish(SolverEvent(
+                        type="insight_received", solver_id=inst.solver_id,
+                        data={"summary": insights_text[:200]},
+                    ))
 
             try:
                 remaining = self.settings.timeout - (time.monotonic() - t0)
@@ -409,21 +502,11 @@ class ChallengeSwarm:
                     inst.cost_usd,
                 )
 
-            flags_found = extract_flags(response.text, self.settings.flag_pattern)
-            if flags_found:
-                for flag in flags_found:
-                    msg_text, is_valid = await do_submit_flag(
-                        flag, self.settings.flag_pattern, self._submitted_flags,
-                        accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
-                    )
-                    self.event_bus.publish(SolverEvent(type="flag_candidate", solver_id=inst.solver_id, data={"flag": flag, "verified": is_valid}))
-                    if is_valid:
-                        inst.flag = flag
-                        inst.confirmed = True
-                        async with self._flag_lock:
-                            if not self.confirmed_flag:
-                                self.confirmed_flag = flag
-                                self.winner_id = inst.solver_id
+            if response.text:
+                inst.findings = response.text.strip()[:2000]
+
+            for flag in extract_flags(response.text, self.settings.flag_pattern):
+                await self._handle_flag_candidate(inst, flag, penalize=False)
 
             if response.done or not response.tool_calls:
                 break
@@ -589,24 +672,8 @@ class ChallengeSwarm:
         elif name == "webhook_get_requests":
             return await do_webhook_get_requests(args.get("uuid", ""))
         elif name == "submit_flag":
-            flag = args.get("flag", "")
-            cooled, msg_text = self._check_cooldown(inst)
-            if not cooled:
-                return msg_text
-            result, is_valid = await do_submit_flag(
-                flag, self.settings.flag_pattern, self._submitted_flags,
-                accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
-            )
-            if is_valid:
-                inst.flag = flag
-                inst.confirmed = True
-                async with self._flag_lock:
-                    if not self.confirmed_flag:
-                        self.confirmed_flag = flag
-                        self.winner_id = inst.solver_id
-            else:
-                self._record_wrong_submit(inst)
-            return result
+            msg_text, _ = await self._handle_flag_candidate(inst, args.get("flag", ""))
+            return msg_text
         elif name == "check_findings":
             return await do_check_findings(self.message_bus, inst.solver_id)
         elif name == "notify_coordinator":
@@ -623,10 +690,14 @@ class ChallengeSwarm:
             return
         solver_states = []
         for sid, inst in self.solvers.items():
+            if sid in self._results:
+                status = self._results[sid].value
+            else:
+                status = "running" if not self.cancel_event.is_set() else "done"
             solver_states.append(SolverState(
                 solver_id=sid,
                 provider=inst.provider_name,
-                status="running" if not self.cancel_event.is_set() else "done",
+                status=status,
                 steps=inst.step_count,
                 cost_usd=inst.cost_usd,
                 flag=inst.flag,
