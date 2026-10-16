@@ -35,7 +35,30 @@ def test_claude_validate_no_key():
     assert p.validate_config({"anthropic_api_key": ""}) is False
 
 
-def test_codex_validate_no_key():
+def test_codex_validate_no_key_and_no_cli_login(monkeypatch):
+    """No API key and no codex CLI login anywhere -> not configured."""
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: None)
+    p = CodexProvider()
+    assert p.validate_config({"openai_api_key": ""}) is False
+
+
+def test_codex_validate_no_key_but_cli_logged_in(monkeypatch, tmp_path):
+    """No API key, but `codex` is installed and has a stored login (e.g. a
+    ChatGPT/Codex subscription) -> configured. _start_process() already
+    inherits that same login via os.environ when no key is injected."""
+    auth_dir = tmp_path / ".codex"
+    auth_dir.mkdir()
+    (auth_dir / "auth.json").write_text("{}")
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("ctf_solver.providers.codex.Path.home", lambda: tmp_path)
+    p = CodexProvider()
+    assert p.validate_config({"openai_api_key": ""}) is True
+
+
+def test_codex_validate_cli_present_but_never_logged_in(monkeypatch, tmp_path):
+    """`codex` binary exists but no auth.json yet -> not configured."""
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("ctf_solver.providers.codex.Path.home", lambda: tmp_path)
     p = CodexProvider()
     assert p.validate_config({"openai_api_key": ""}) is False
 
