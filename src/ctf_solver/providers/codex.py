@@ -255,11 +255,20 @@ class CodexSession(SolverSession):
                             ToolCall(name=tool_name, arguments=arguments, call_id=call_id)
                         )
                     elif method == "item/completed":
-                        text = ""
-                        for item in params.get("item", {}).get("content", []):
-                            if item.get("type") == "text":
-                                text += item.get("text", "")
-                        self._text_buffer = text
+                        item = params.get("item", {})
+                        # Only the assistant's own reply updates the buffer —
+                        # not the echoed userMessage item that completes first.
+                        if item.get("type") == "agentMessage":
+                            text = item.get("text")
+                            if text is None:
+                                # Older/alternate shape: content is a list of
+                                # {"type": "text", "text": ...} parts.
+                                text = "".join(
+                                    c.get("text", "")
+                                    for c in item.get("content", []) or []
+                                    if isinstance(c, dict) and c.get("type") == "text"
+                                )
+                            self._text_buffer = text or ""
                     elif method == "turn/completed":
                         self._turn_done_event.set()
                         await self._tool_call_queue.put(None)
