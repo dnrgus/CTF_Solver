@@ -6,8 +6,8 @@ from conftest import MockProvider, resp, tool
 from test_swarm_behavioral import _bash_turn, _swarm
 
 import ctf_solver.solver.swarm as swarm_mod
-from ctf_solver.providers.base import TokenUsage
 from ctf_solver.prompts import ChallengeMeta, build_prompt
+from ctf_solver.providers.base import TokenUsage
 from ctf_solver.solver.solver_base import ResultStatus
 from ctf_solver.solver.swarm import _is_placeholder_flag
 
