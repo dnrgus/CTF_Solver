@@ -191,6 +191,7 @@ class ChallengeSwarm:
     category: str
     settings: Settings
     event_bus: EventBus
+    connection_info: str = ""
     cost_tracker: CostTracker = field(default_factory=CostTracker)
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
     solvers: dict[str, SolverInstance] = field(default_factory=dict)
@@ -429,6 +430,7 @@ class ChallengeSwarm:
             name=self.challenge_name,
             category=self.category,
             description=self.description,
+            connection_info=self.connection_info,
         )
         distfiles = list_distfiles(self.challenge_dir)
         container_arch = "linux/amd64"

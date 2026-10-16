@@ -32,7 +32,10 @@ def _settings(tmp_path, **kw) -> Settings:
     return Settings(**base)
 
 
-def _swarm(tmp_path, **settings_kw) -> ChallengeSwarm:
+def _swarm(tmp_path, connection_info: str = "", **settings_kw) -> ChallengeSwarm:
+    # connection_info is a ChallengeSwarm field, not a Settings one — pulled out
+    # explicitly so passing it here doesn't silently vanish into Settings'
+    # extra="ignore" (it used to: there was no ChallengeSwarm field for it at all).
     return ChallengeSwarm(
         challenge_dir=str(tmp_path),
         challenge_name="test",
@@ -40,6 +43,7 @@ def _swarm(tmp_path, **settings_kw) -> ChallengeSwarm:
         category="misc",
         settings=_settings(tmp_path, **settings_kw),
         event_bus=EventBus(),
+        connection_info=connection_info,
     )
 
 
@@ -344,3 +348,32 @@ async def test_regex_text_mention_does_not_penalize_submit(tmp_path, patch_backe
     assert inst._wrong_submit_count == 0
     cooled, _ = swarm._check_cooldown(inst)
     assert cooled is True
+
+
+async def test_connection_info_reaches_system_prompt(tmp_path, patch_backends):
+    """ChallengeSwarm.connection_info flows into ChallengeMeta -> build_prompt,
+    so the service-connection prompt section (ported from verialabs) is
+    actually reachable — it used to be dropped on the floor before this
+    (the field didn't even exist on ChallengeSwarm)."""
+    provider = MockProvider({"claude-0": [resp(text="no flag yet")]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, connection_info="nc 1.2.3.4 1337", claude_count=1)
+
+    await swarm.run()
+
+    prompt = provider.sessions["claude-0"].system_prompt
+    assert "nc 1.2.3.4 1337" in prompt
+    assert "FIRST ACTION REQUIRED" in prompt
+    assert "## Service Connection" in prompt
+
+
+async def test_empty_connection_info_skips_service_section(tmp_path, patch_backends):
+    provider = MockProvider({"claude-0": [resp(text="no flag yet")]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, claude_count=1)  # connection_info defaults to ""
+
+    await swarm.run()
+
+    prompt = provider.sessions["claude-0"].system_prompt
+    assert "FIRST ACTION REQUIRED" not in prompt
+    assert "## Service Connection" not in prompt

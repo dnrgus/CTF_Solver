@@ -28,6 +28,36 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+_SKIP_DIR_NAMES = {".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache", ".mypy_cache"}
+
+
+def _auto_discover_files(cwd: Path) -> list[str]:
+    """Bare-invocation file discovery: every regular file directly in `cwd`,
+    plus one level into a conventional `distfiles/` subdirectory if present.
+    Hidden files/dirs and common tooling noise are skipped."""
+    out: list[str] = []
+    for p in sorted(cwd.iterdir()):
+        if p.name.startswith("."):
+            continue
+        if p.is_file():
+            out.append(str(p))
+        elif p.is_dir() and p.name == "distfiles":
+            out.extend(str(f) for f in sorted(p.iterdir()) if f.is_file() and not f.name.startswith("."))
+        elif p.is_dir() and p.name in _SKIP_DIR_NAMES:
+            continue
+    return out
+
+
+def _prompt_or_x(label: str) -> str:
+    """Prompt for one line; typing X (any case) means "none" -> empty string.
+
+    Used for both 문제설명 (no description) and 원격 서버 (no remote target —
+    solve using only the given files, locally)."""
+    raw = click.prompt(f"{label} — 없으면 X", default="", show_default=False)
+    raw = raw.strip()
+    return "" if raw.upper() == "X" else raw
+
+
 def _setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -41,6 +71,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--challenge-dir", default=None, help="Challenge directory")
 @click.option("--files", multiple=True, help="Individual challenge files")
 @click.option("--desc", default=None, help="Challenge description (required with --files)")
+@click.option("--remote", default=None, help="Connection info, e.g. 'nc host port' or a URL")
 @click.option("--category", default=None, help="Category hint")
 @click.option("--claude", "claude_count", default=None, type=int, help="Number of Claude solvers")
 @click.option("--codex", "codex_count", default=None, type=int, help="Number of Codex solvers")
@@ -72,6 +103,7 @@ def main(
     challenge_dir: str | None,
     files: tuple[str, ...],
     desc: str | None,
+    remote: str | None,
     category: str | None,
     claude_count: int | None,
     codex_count: int | None,
@@ -177,11 +209,23 @@ def main(
         console.print("[red]Error: --challenge-dir and --files are mutually exclusive[/red]")
         sys.exit(1)
 
-    if files and not desc:
+    # Bare invocation (no --challenge-dir / --files / --desc / --resume): auto-pick up
+    # whatever's sitting in the current directory and ask the two things that can't
+    # be guessed, instead of erroring out demanding flags.
+    bare_mode = not challenge_dir and not files and not desc and not resume_state
+    if bare_mode:
+        auto_files = _auto_discover_files(Path.cwd())
+        names = ", ".join(Path(f).name for f in auto_files) or "(없음)"
+        console.print(f"[dim]현재 폴더에서 파일 {len(auto_files)}개를 찾았습니다: {names}[/dim]")
+        files = tuple(auto_files)
+        desc = _prompt_or_x("문제설명")
+        remote = _prompt_or_x("원격 서버 (예: nc host port)")
+
+    if files and desc is None:
         console.print("[red]Error: --desc is required when using --files[/red]")
         sys.exit(1)
 
-    if not challenge_dir and not files:
+    if not challenge_dir and not files and not bare_mode:
         console.print("[red]Error: specify --challenge-dir or --files[/red]")
         sys.exit(1)
 
@@ -258,6 +302,8 @@ def main(
                     desc = meta.description
                     if not category:
                         category = meta.category
+                    if not remote:
+                        remote = meta.connection_info
                 else:
                     desc = (desc_path / candidate).read_text().strip()
                 break
@@ -270,6 +316,7 @@ def main(
         category=category or "",
         settings=settings,
         event_bus=event_bus,
+        connection_info=remote or "",
         resume_state=resume_state,
     )
 
@@ -494,3 +541,9 @@ def send_message(message: str, port: int, host: str) -> None:
     except Exception as e:
         console.print(f"[red]Failed:[/red] {e}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    # So `python3 -m ctf_solver.cli` (or running this file directly) also
+    # works, not just the installed `ctf-solve` console script.
+    main()

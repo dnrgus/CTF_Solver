@@ -123,6 +123,7 @@ class MockProvider(ProviderBase):
 
     async def create_session(self, solver_id, system_prompt, tools, config) -> MockSession:
         session = MockSession(self.scripts.get(solver_id, []))
+        session.system_prompt = system_prompt  # exposed for prompt-wiring assertions
         self.sessions[solver_id] = session
         return session
 
