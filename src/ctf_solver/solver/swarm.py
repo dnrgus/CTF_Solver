@@ -44,6 +44,32 @@ MAX_CONSECUTIVE_ERRORS = 3
 
 SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]
 
+# Re-engagement (bump) of solvers that stopped without a flag: cooldown grows
+# linearly with the bump count, capped. Module-level so tests can shrink it.
+BUMP_COOLDOWN_STEP = 30.0
+BUMP_COOLDOWN_MAX = 300.0
+INSIGHT_SHARE_INTERVAL = 5
+
+_PLACEHOLDER_MARKERS = ("placeholder", "example", "fake", "xxxx", "redacted")
+_PLACEHOLDER_BODIES = {"flag", "...", "", "test", "here", "your_flag_here"}
+
+
+def _is_placeholder_flag(flag: str) -> bool:
+    """True for template flags like CTF{flag} or FLAG{placeholder}."""
+    body = flag[flag.find("{") + 1 : flag.rfind("}")].strip().lower() if "{" in flag else ""
+    return body in _PLACEHOLDER_BODIES or any(m in body for m in _PLACEHOLDER_MARKERS)
+
+
+def _load_harness(path: str) -> str:
+    """Read the optional external harness file (empty string when unset)."""
+    if not path:
+        return ""
+    return Path(path).expanduser().read_text(encoding="utf-8")
+
+
+def _bump_cooldown(bump_no: int) -> float:
+    return min(bump_no * BUMP_COOLDOWN_STEP, BUMP_COOLDOWN_MAX)
+
 
 def _build_tool_defs() -> list[ToolDef]:
     return [
@@ -152,6 +178,9 @@ class SolverInstance:
     cost_usd: float = 0.0
     _wrong_submit_count: int = 0
     _last_submit_time: float = 0.0
+    attempt_start_step: int = 0
+    last_share_step: int = 0
+    pending_results: list[ToolResult] | None = None
 
 
 @dataclass
@@ -207,21 +236,36 @@ class ChallengeSwarm:
         flag = flag.strip()
         if not flag:
             return "Empty flag — nothing to validate.", False
-        if flag in self._submitted_flags:
-            return "Already tried this flag.", False
-        if not extract_flags(flag, self.settings.flag_pattern):
-            return f"Flag '{flag}' does not match expected pattern.", False
+        if _is_placeholder_flag(flag):
+            return f"Flag '{flag}' looks like a placeholder — not a real flag.", False
 
-        # Deliberate submissions are subject to the escalating cooldown.
-        if penalize:
-            cooled, cooldown_msg = self._check_cooldown(inst)
-            if not cooled:
-                return cooldown_msg, False
+        # Dedup, cooldown and verification are decided atomically so two solvers
+        # racing on the same flag cannot both pass the "not yet tried" check.
+        async with self._flag_lock:
+            if flag in self._submitted_flags:
+                return "Already tried this flag.", False
+            if not extract_flags(flag, self.settings.flag_pattern):
+                return f"Flag '{flag}' does not match expected pattern.", False
 
-        result, is_valid = await do_submit_flag(
-            flag, self.settings.flag_pattern, self._submitted_flags,
-            accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
-        )
+            # Deliberate submissions are subject to the escalating cooldown.
+            if penalize:
+                cooled, cooldown_msg = self._check_cooldown(inst)
+                if not cooled:
+                    return cooldown_msg, False
+
+            result, is_valid = await do_submit_flag(
+                flag, self.settings.flag_pattern, self._submitted_flags,
+                accept_regex_as_verified=self.settings.accept_regex_flag_as_verified,
+            )
+            if is_valid:
+                inst.flag = flag
+                inst.confirmed = True
+                if not self.confirmed_flag:
+                    self.confirmed_flag = flag
+                    self.winner_id = inst.solver_id
+            elif penalize:
+                self._record_wrong_submit(inst)
+
         self.event_bus.publish(SolverEvent(
             type="flag_candidate", solver_id=inst.solver_id,
             data={"flag": flag, "verified": is_valid},
@@ -230,15 +274,6 @@ class ChallengeSwarm:
             solver_id=inst.solver_id, step=inst.step_count, category="flag_candidate",
             content=f"Candidate flag: {flag}", confidence=0.9 if is_valid else 0.4,
         ))
-        if is_valid:
-            inst.flag = flag
-            inst.confirmed = True
-            async with self._flag_lock:
-                if not self.confirmed_flag:
-                    self.confirmed_flag = flag
-                    self.winner_id = inst.solver_id
-        elif penalize:
-            self._record_wrong_submit(inst)
         return result, is_valid
 
     def _create_circuit_breakers(self) -> dict[str, CircuitBreaker]:
@@ -397,17 +432,20 @@ class ChallengeSwarm:
         )
         distfiles = list_distfiles(self.challenge_dir)
         container_arch = "linux/amd64"
-        system_prompt = build_prompt(meta, distfiles, container_arch, hint=self.settings.hint)
+        system_prompt = build_prompt(
+            meta, distfiles, container_arch, hint=self.settings.hint,
+            harness=_load_harness(self.settings.harness_file),
+        )
         tools = _build_tool_defs()
         inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
         return None
 
-    async def _run_loop(self, inst: SolverInstance, t0: float) -> SolverResult:
-        message = "Start solving."
-        pending_tool_results: list[ToolResult] | None = None
+    async def _run_loop(
+        self, inst: SolverInstance, t0: float, message: str = "Start solving."
+    ) -> SolverResult:
 
         while not self.cancel_event.is_set():
-            if inst.step_count >= self.settings.max_steps:
+            if inst.step_count - inst.attempt_start_step >= self.settings.max_steps:
                 break
             elapsed = time.monotonic() - t0
             if elapsed >= self.settings.timeout:
@@ -428,7 +466,8 @@ class ChallengeSwarm:
             if cb and not cb.is_available():
                 break
 
-            if inst.step_count > 0 and inst.step_count % 5 == 0:
+            if inst.step_count - inst.last_share_step >= INSIGHT_SHARE_INTERVAL:
+                inst.last_share_step = inst.step_count
                 # Share this solver's latest reasoning with siblings...
                 if inst.findings:
                     await self.message_bus.post(InsightMessage(
@@ -453,7 +492,7 @@ class ChallengeSwarm:
                 remaining = self.settings.timeout - (time.monotonic() - t0)
                 if remaining <= 0:
                     break
-                _msg, _presults = message, pending_tool_results
+                _msg, _presults = message, inst.pending_results
                 response = await asyncio.wait_for(
                     retry_with_backoff(
                         lambda m=_msg, p=_presults: inst.session.send(m, tool_results=p),
@@ -480,6 +519,7 @@ class ChallengeSwarm:
 
             if cb:
                 cb.record_success()
+            inst.pending_results = None
 
             self.cost_tracker.record_tokens(
                 inst.solver_id,
@@ -512,12 +552,19 @@ class ChallengeSwarm:
                 break
 
             tool_results: list[ToolResult] = []
+            # Every tool_use needs a tool_result before the next send, even if we
+            # stop mid-batch (loop break, error cap) and later resume via a bump.
+            inst.pending_results = [
+                ToolResult(content="Not executed (solver paused).", tool_use_id=c.call_id, call_id=c.call_id)
+                for c in response.tool_calls
+            ]
             for tc in response.tool_calls:
                 inst.step_count += 1
                 if inst.tracer:
                     inst.tracer.tool_call(tc.name, tc.arguments, inst.step_count)
                 tr = await self._execute_tool(inst, tc)
                 tool_results.append(tr)
+                inst.pending_results[len(tool_results) - 1] = tr
 
                 trace_content = tr.content if isinstance(tr.content, str) else f"<image {tr.content[1]}>"
                 if inst.tracer:
@@ -557,7 +604,6 @@ class ChallengeSwarm:
                     )
 
             message = ""
-            pending_tool_results = tool_results if tool_results else None
 
         if inst.confirmed and inst.flag:
             return SolverResult(
@@ -587,6 +633,52 @@ class ChallengeSwarm:
 
         return result
 
+    async def _should_bump(
+        self, inst: SolverInstance, result: SolverResult, t0: float, bumps: int
+    ) -> bool:
+        """Decide whether a solver that stopped without a flag gets another attempt."""
+        if bumps >= self.settings.max_bumps or self.cancel_event.is_set():
+            return False
+        if result.status not in (ResultStatus.FAILED, ResultStatus.LOOP_DETECTED, ResultStatus.ERROR):
+            return False
+        if inst.confirmed or self.confirmed_flag:
+            return False
+        if result.steps == 0 and result.cost_usd == 0.0:
+            return False  # broken solver — do not burn time re-running it
+        if result.status == ResultStatus.ERROR and inst.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            return False
+        if self.cost_tracker.is_over_budget(self.settings.max_cost):
+            return False
+        cb = self._circuit_breakers.get(inst.provider_name)
+        if cb and not cb.is_available():
+            return False
+        return self.settings.timeout - (time.monotonic() - t0) > _bump_cooldown(bumps + 1)
+
+    async def _bump(
+        self, inst: SolverInstance, prev: SolverResult, t0: float, bump_no: int
+    ) -> SolverResult:
+        """Wait out the cooldown, hand the solver sibling insights, and resume it."""
+        try:
+            await asyncio.wait_for(self.cancel_event.wait(), timeout=_bump_cooldown(bump_no))
+            return prev  # cancelled during cooldown
+        except TimeoutError:
+            pass
+        insights = await do_check_findings(self.message_bus, inst.solver_id)
+        if "No new findings" in insights or "No message bus" in insights:
+            insights = "No sibling insights available yet."
+        self.event_bus.publish(SolverEvent(
+            type="solver_bumped", solver_id=inst.solver_id, data={"bump": bump_no},
+        ))
+        logger.info("[%s] Bumped (%d), resuming", inst.solver_id, bump_no)
+        inst.attempt_start_step = inst.step_count
+        inst.consecutive_errors = 0
+        inst.loop_detector.reset()
+        message = (
+            "You stopped without a confirmed flag. Do not repeat earlier dead ends — "
+            "try a different approach.\n\n" + insights
+        )
+        return await self._run_loop(inst, t0, message=message)
+
     async def _run_solver(self, inst: SolverInstance) -> SolverResult | None:
         t0 = time.monotonic()
         try:
@@ -594,6 +686,10 @@ class ChallengeSwarm:
             if err:
                 return err
             result = await self._run_loop(inst, t0)
+            bumps = 0
+            while await self._should_bump(inst, result, t0, bumps):
+                bumps += 1
+                result = await self._bump(inst, result, t0, bumps)
             return result
         except NotImplementedError as e:
             logger.warning("[%s] Provider stub: %s", inst.solver_id, e)

@@ -118,11 +118,49 @@ def _category_tips(category: str) -> list[str]:
     return []
 
 
+def _connection_hint(conn_info: str) -> str:
+    if re.match(r"^https?://", conn_info):
+        return "This is a **web service**. Use `bash` with `curl`/`python3 requests`, or use `web_fetch`."
+    if conn_info.startswith("nc "):
+        return (
+            "This is a **TCP service**. Each `bash` call is a fresh process — "
+            "use a heredoc to send multiple lines in one shot:\n"
+            "```\n"
+            f"{conn_info} <<'EOF'\ncommand1\ncommand2\nEOF\n"
+            "```\n"
+            "Or write a Python `socket` / `pwntools` script for stateful interaction."
+        )
+    return "Connect using the details above."
+
+
+_BINARY_CATEGORIES = {"rev", "pwn", "misc", ""}
+
+
+def _binary_analysis_section(category: str) -> list[str]:
+    cat = (category or "").lower()
+    key = _CATEGORY_ALIASES.get(cat, cat)
+    if key not in _BINARY_CATEGORIES:
+        return []
+    return [
+        "## Binary Analysis",
+        "**pyghidra** is installed for decompilation. Use it via bash:",
+        "```python",
+        "import pyghidra",
+        "with pyghidra.open_program('/challenge/distfiles/binary') as flat_api:",
+        "    listing = flat_api.currentProgram.getListing()",
+        "    # Iterate functions, decompile, etc.",
+        "```",
+        "Also available: radare2 (`r2`), gdb, angr, capstone.",
+        "",
+    ]
+
+
 def build_prompt(
     meta: ChallengeMeta,
     distfile_names: list[str],
     container_arch: str = "unknown",
     hint: str = "",
+    harness: str = "",
 ) -> str:
     conn_info = _rewrite_connection_info(meta.connection_info.strip())
     lines: list[str] = [
@@ -132,8 +170,9 @@ def build_prompt(
 
     if conn_info:
         lines += [
-            "> FIRST ACTION: Connect to the service now.",
-            f"> Run: `{conn_info}`",
+            "> **FIRST ACTION REQUIRED**: Your very first tool call MUST connect to the service.",
+            f"> Run: `{conn_info}` (use a heredoc or pwntools script as shown below).",
+            "> Do NOT explore the sandbox filesystem first. The flag is on the service, not in the container.",
             "",
         ]
 
@@ -146,12 +185,20 @@ def build_prompt(
     ]
     lines += ["", "## Description", meta.description or "No description provided.", ""]
 
+    if conn_info:
+        lines += ["## Service Connection", "```", conn_info, "```", _connection_hint(conn_info), ""]
+
     if distfile_names:
         lines.append("## Attached Files")
         for name in distfile_names:
             ext = Path(name).suffix.lower()
             is_img = ext in IMAGE_EXTS
-            suffix = " <- IMAGE: use steghide/exiftool/strings via bash" if is_img else ""
+            suffix = (
+                "  <- **IMAGE: call `view_image` first** (fix magic bytes if corrupt), "
+                "then `exiftool`/`steghide`/`zsteg`/`strings` via bash"
+                if is_img
+                else ""
+            )
             lines.append(f"- `/challenge/distfiles/{name}`{suffix}")
         lines.append("")
 
@@ -173,6 +220,8 @@ def build_prompt(
         "",
     ]
 
+    lines += _binary_analysis_section(meta.category)
+
     tips = _category_tips(meta.category)
     if tips:
         lines.append(f"## Strategy ({meta.category})")
@@ -189,6 +238,14 @@ def build_prompt(
         "4. Recover the flag, then verify it with `submit_flag` (it checks the pattern locally).",
         "5. Ignore placeholder flags like `CTF{flag}` or `FLAG{placeholder}`.",
         "6. Once you have the real flag, output `FLAG: <value>` on its own line.",
+        "7. Do not guess a flag and do not stop to ask questions — cover maximum surface area:",
+        "   hidden files, env vars, backups, HTTP headers, error messages, timing, encoding tricks.",
+        "   Pwn over nc: `stty raw -echo` before launching vulnerable binaries.",
     ]
+
+    if harness.strip():
+        # User-supplied harness (rules, completion criteria, workflow) is appended
+        # last so A/B runs differ only by this block.
+        lines += ["", "## Harness", harness.strip()]
 
     return "\n".join(lines)

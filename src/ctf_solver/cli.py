@@ -53,6 +53,9 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--flag-pattern", default=None, help="Regex for flag extraction")
 @click.option("--hint", default=None, help="Pre-inject hint")
 @click.option("--interactive", is_flag=True, help="Enable stdin hint input")
+@click.option("--harness-file", default=None, type=click.Path(exists=True, dir_okay=False), help="Extra harness text appended to every solver's system prompt (for A/B runs)")
+@click.option("--max-bumps", default=None, type=int, help="Re-engage a stopped solver up to N times with sibling insights (0 = off)")
+@click.option("--strict-flags", is_flag=True, help="Do not auto-confirm regex-matching flags (candidates are only recorded)")
 @click.option("--sandbox-image", default=None, help="Docker image")
 @click.option("--sandbox-memory", default=None, help="Memory limit per container")
 @click.option("--sandbox-cpus", default=None, type=int, help="CPU limit per container")
@@ -81,6 +84,9 @@ def main(
     flag_pattern: str | None,
     hint: str | None,
     interactive: bool,
+    harness_file: str | None,
+    max_bumps: int | None,
+    strict_flags: bool,
     sandbox_image: str | None,
     sandbox_memory: str | None,
     sandbox_cpus: int | None,
@@ -191,6 +197,9 @@ def main(
         flag_pattern=flag_pattern or Settings.model_fields["flag_pattern"].default,
         hint=hint or "",
         interactive=interactive,
+        harness_file=harness_file or "",
+        max_bumps=max_bumps if max_bumps is not None else defaults.max_bumps,
+        accept_regex_flag_as_verified=not strict_flags,
         sandbox_image=sandbox_image or defaults.sandbox_image,
         sandbox_memory=sandbox_memory or defaults.sandbox_memory,
         sandbox_cpus=sandbox_cpus if sandbox_cpus is not None else defaults.sandbox_cpus,

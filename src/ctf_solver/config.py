@@ -35,7 +35,11 @@ class Settings(BaseSettings):
     flag_pattern: str = r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"
 
     # Hints
-    accept_regex_flag_as_verified: bool = False
+    # No external judge in manual mode, so a pattern match is the only check.
+    # --strict-flags turns this off (candidates are recorded but never confirmed).
+    accept_regex_flag_as_verified: bool = True
+    max_bumps: int = 2
+    harness_file: str = ""
     hint: str = ""
     interactive: bool = False
 
