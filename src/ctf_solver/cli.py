@@ -209,14 +209,20 @@ def main(
         console.print("[red]Error: --challenge-dir and --files are mutually exclusive[/red]")
         sys.exit(1)
 
-    # Bare invocation (no --challenge-dir / --files / --desc / --resume): auto-pick up
-    # whatever's sitting in the current directory and ask the two things that can't
-    # be guessed, instead of erroring out demanding flags.
+    # Bare invocation (no --challenge-dir / --files / --desc / --resume): ask where
+    # the challenge actually lives — you run this from wherever the solver is
+    # installed, not from inside the challenge folder — then auto-pick up its
+    # files and ask the two things that can't be guessed.
     bare_mode = not challenge_dir and not files and not desc and not resume_state
     if bare_mode:
-        auto_files = _auto_discover_files(Path.cwd())
+        raw_dir = click.prompt("분석할 문제 폴더 경로", default=str(Path.cwd()), show_default=True)
+        target_dir = Path(raw_dir).expanduser().resolve()
+        if not target_dir.is_dir():
+            console.print(f"[red]Error: 존재하지 않는 폴더입니다: {target_dir}[/red]")
+            sys.exit(1)
+        auto_files = _auto_discover_files(target_dir)
         names = ", ".join(Path(f).name for f in auto_files) or "(없음)"
-        console.print(f"[dim]현재 폴더에서 파일 {len(auto_files)}개를 찾았습니다: {names}[/dim]")
+        console.print(f"[dim]{target_dir} 에서 파일 {len(auto_files)}개를 찾았습니다: {names}[/dim]")
         files = tuple(auto_files)
         desc = _prompt_or_x("문제설명")
         remote = _prompt_or_x("원격 서버 (예: nc host port)")
