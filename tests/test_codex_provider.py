@@ -415,8 +415,29 @@ async def test_turn_continuation_sends_rpc_response_and_drains_next_batch(fake_p
 # --------------------------------------------------------------------------- #
 # 5. turn/completed -> done with text
 # --------------------------------------------------------------------------- #
-async def test_turn_completed_text_only_sets_done(fake_proc):
-    """Only text via item/completed then turn/completed -> done=True with text."""
+async def test_turn_completed_agent_message_text_sets_done(fake_proc):
+    """A real app-server agentMessage item (direct ``text`` field, as observed
+    against a live `codex app-server`) is captured into response.text."""
+    session = make_session()
+    resp = await drive_turn(
+        session,
+        fake_proc,
+        "summarize",
+        [
+            {
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "hello world"}},
+            }
+        ],
+    )
+    assert resp.done is True
+    assert resp.tool_calls == []
+    assert resp.text == "hello world"
+    await session.close()
+
+
+async def test_turn_completed_agent_message_content_array_fallback(fake_proc):
+    """Fallback shape: agentMessage with a content-array instead of ``text``."""
     session = make_session()
     resp = await drive_turn(
         session,
@@ -427,18 +448,45 @@ async def test_turn_completed_text_only_sets_done(fake_proc):
                 "method": "item/completed",
                 "params": {
                     "item": {
+                        "type": "agentMessage",
                         "content": [
                             {"type": "text", "text": "hello "},
                             {"type": "text", "text": "world"},
-                        ]
+                        ],
                     }
                 },
             }
         ],
     )
-    assert resp.done is True
-    assert resp.tool_calls == []
     assert resp.text == "hello world"
+    await session.close()
+
+
+async def test_user_message_echo_does_not_overwrite_text_buffer(fake_proc):
+    """The echoed userMessage item/completed (which fires before the assistant's
+    own agentMessage) must not be mistaken for the assistant's reply."""
+    session = make_session()
+    resp = await drive_turn(
+        session,
+        fake_proc,
+        "go",
+        [
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "go"}],
+                    }
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {"item": {"type": "agentMessage", "text": "real reply"}},
+            },
+        ],
+    )
+    assert resp.text == "real reply"
     await session.close()
 
 
