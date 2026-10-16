@@ -7,6 +7,8 @@ import base64
 import json
 import logging
 import os
+import shutil
+from pathlib import Path
 
 from ctf_solver.providers.base import (
     ProviderBase,
@@ -363,7 +365,13 @@ class CodexProvider(ProviderBase):
     name = "codex"
 
     def validate_config(self, config: dict) -> bool:
-        return bool(config.get("openai_api_key", ""))
+        if config.get("openai_api_key"):
+            return True
+        # No API key configured — fall back to the `codex` CLI's own stored
+        # login (ChatGPT subscription), the same auth `_start_process` already
+        # inherits via `os.environ` when no key is injected. Best-effort: this
+        # only checks that *something* is logged in, not that it is still valid.
+        return shutil.which("codex") is not None and (Path.home() / ".codex" / "auth.json").exists()
 
     async def create_session(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> CodexSession:
         return CodexSession(solver_id, system_prompt, tools, config)
