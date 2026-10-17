@@ -11,7 +11,7 @@ import ctf_solver.solver.swarm as swarm_mod
 from ctf_solver.prompts import ChallengeMeta, build_prompt
 from ctf_solver.providers.base import TokenUsage
 from ctf_solver.solver.solver_base import ResultStatus
-from ctf_solver.solver.swarm import _is_placeholder_flag
+from ctf_solver.solver.swarm import _is_placeholder_flag, _parse_connection_info
 
 
 def _fast_bump(monkeypatch):
@@ -84,9 +84,42 @@ def test_placeholder_detection_catches_known_sandbox_decoys():
     """Decoy flags found planted in challenge/sandbox files to catch naive
     strings/grep solving — observed live during a POCTF_2026 benchmark run
     where the solver declared victory in <60s without ever touching the
-    remote target."""
+    remote target. Each challenge plants its own thematic decoy rather than
+    reusing one string, so the check must catch the *pattern* (a bait word
+    as a distinct token), not just a hardcoded list."""
     assert _is_placeholder_flag("POCTF{dev.flag.local.testing.only}")
     assert _is_placeholder_flag("POCTF{local_test_flag_padding_oracle_cbc}")
+    assert _is_placeholder_flag("POCTF{local_safelua_popen_test}")
+    assert _is_placeholder_flag("POCTF{local_cache_poisoning_success}")
+    assert _is_placeholder_flag("POCTF{LOCAL_ALIAS_BYPASS}")
+    # Must not false-positive on real-looking thematic/hash-style flags.
+    assert not _is_placeholder_flag("FLAG{r34l_fl4g_9f2}")
+    assert not _is_placeholder_flag("POCTF{2.1018.NVELXHEZTUSJZGYT.PRKMJ6RRWXNWBESGSBJV3SHCVK}")
+    assert not _is_placeholder_flag("POCTF{Arizona_State_University}")
+
+
+def test_parse_connection_info_nc_style():
+    assert _parse_connection_info("nc 169.58.126.107 5007") == ("169.58.126.107", "5007")
+    assert _parse_connection_info("169.58.126.107:5007") == ("169.58.126.107", "5007")
+
+
+def test_parse_connection_info_web_url_defaults_port_by_scheme():
+    """Web-category challenges give connection_info as a bare URL with no
+    port -- found live when this previously fell through to treating
+    'https' itself as the host, which could never resolve, so the remote
+    reachability probe always errored out and the decoy-rejection gate
+    silently never engaged for any web challenge."""
+    assert _parse_connection_info("https://poisoned-well.pointeroverflowctf.com/") == (
+        "poisoned-well.pointeroverflowctf.com", "443",
+    )
+    assert _parse_connection_info("http://shape-of-query.pointeroverflowctf.com") == (
+        "shape-of-query.pointeroverflowctf.com", "80",
+    )
+    assert _parse_connection_info("https://example.com:8443/path") == ("example.com", "8443")
+
+
+def test_parse_connection_info_empty():
+    assert _parse_connection_info("") == (None, None)
 
 
 async def test_flag_rejected_without_remote_contact_when_target_has_connection_info(tmp_path, patch_backends, monkeypatch):
@@ -151,13 +184,13 @@ async def test_flag_accepted_after_remote_contact(tmp_path, patch_backends):
 
 async def test_flag_accepted_without_remote_contact_when_no_connection_info(tmp_path, patch_backends):
     """Local-only challenges (no remote target) are unaffected by the gate."""
-    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{local_only_challenge}")])]})
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{no_remote_target_here}")])]})
     patch_backends(provider)
     swarm = _swarm(tmp_path, claude_count=1)
 
     await swarm.run()
 
-    assert swarm.confirmed_flag == "CTF{local_only_challenge}"
+    assert swarm.confirmed_flag == "CTF{no_remote_target_here}"
 
 
 async def test_strict_flags_never_confirms(tmp_path, patch_backends):

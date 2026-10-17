@@ -53,27 +53,43 @@ BUMP_COOLDOWN_MAX = 300.0
 INSIGHT_SHARE_INTERVAL = 5
 MIN_STEPS_BEFORE_UNCONTACTED_FLAG = 3
 
-_PLACEHOLDER_MARKERS = (
-    "placeholder", "example", "fake", "xxxx", "redacted",
-    "dev.flag", "local_test", "local.test", "testing.only", "dummy_flag",
-    "sample_flag", "test_flag_do_not_submit",
-)
+_PLACEHOLDER_MARKERS = ("placeholder", "example", "fake", "xxxx", "redacted")
 _PLACEHOLDER_BODIES = {"flag", "...", "", "test", "here", "your_flag_here"}
+# Bait/decoy flags planted in challenge files or sandbox images to catch naive
+# strings/grep solving are, empirically, short human-readable phrases with a
+# "this isn't real" word as a distinct token (underscore/dot/space-bounded) --
+# "local_safelua_popen_test", "LOCAL_ALIAS_BYPASS", "dev.flag.local.testing.only",
+# "local_cache_poisoning_success" all match; a real flag's thematic content
+# essentially never does.
+_PLACEHOLDER_WORD_RE = re.compile(
+    r"(?:^|[_.\s])(local|dev|dummy|sample|placeholder|example|fake|redacted|test(?:ing)?|staging)(?:[_.\s]|$)",
+    re.IGNORECASE,
+)
 
 
 def _is_placeholder_flag(flag: str) -> bool:
     """True for template flags like CTF{flag} or known decoy/bait strings
     planted in challenge sandboxes to catch naive strings/grep solving."""
     body = flag[flag.find("{") + 1 : flag.rfind("}")].strip().lower() if "{" in flag else ""
-    return body in _PLACEHOLDER_BODIES or any(m in body for m in _PLACEHOLDER_MARKERS)
+    return (
+        body in _PLACEHOLDER_BODIES
+        or any(m in body for m in _PLACEHOLDER_MARKERS)
+        or bool(_PLACEHOLDER_WORD_RE.search(body))
+    )
 
 
 def _parse_connection_info(connection_info: str) -> tuple[str | None, str | None]:
-    """Best-effort host/port extraction from a free-form connection hint
-    like "nc 169.58.126.107 5007" or "169.58.126.107:5007"."""
+    """Best-effort host/port extraction from a free-form connection hint like
+    "nc 169.58.126.107 5007", "169.58.126.107:5007", or a web challenge's
+    "https://foo.example.com/" (no explicit port -> scheme default)."""
     if not connection_info:
         return None, None
-    tokens = re.split(r"[\s:]+", connection_info.strip())
+    s = connection_info.strip()
+    m = re.match(r"^(https?)://([^/:\s]+)(?::(\d+))?", s, re.IGNORECASE)
+    if m:
+        scheme, host, port = m.group(1).lower(), m.group(2), m.group(3)
+        return host, port or ("443" if scheme == "https" else "80")
+    tokens = re.split(r"[\s:]+", s)
     host: str | None = None
     port: str | None = None
     for tok in tokens:
