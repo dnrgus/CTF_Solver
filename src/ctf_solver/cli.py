@@ -312,6 +312,10 @@ def main(
         confirmed = click.confirm("Running without Docker sandbox is dangerous. Continue?", default=False)
         if not confirmed:
             return
+    else:
+        from ctf_solver.sandbox.docker import cleanup_orphan_containers
+
+        asyncio.run(cleanup_orphan_containers())
 
     if challenge_dir:
         chall_dir = challenge_dir

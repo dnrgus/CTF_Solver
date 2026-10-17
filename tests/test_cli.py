@@ -1,5 +1,7 @@
 """Tests for CLI."""
 
+from unittest.mock import AsyncMock
+
 from click.testing import CliRunner
 
 from ctf_solver.cli import _auto_discover_files, _prompt_or_x, main
@@ -98,6 +100,29 @@ def test_dry_run():
     ])
     assert result.exit_code == 0
     assert "DRY RUN" in result.output
+
+
+def test_startup_cleans_up_orphan_containers_before_running(monkeypatch):
+    """Leftover containers from a killed previous run (e.g. the batch
+    orchestrator getting killed without its children finishing their
+    `finally: sandbox.stop()`) must not silently pile up forever."""
+    import ctf_solver.cli as cli_mod
+
+    called = []
+    monkeypatch.setattr(
+        "ctf_solver.sandbox.docker.cleanup_orphan_containers",
+        AsyncMock(side_effect=lambda: called.append(True)),
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("stop here — cleanup already ran")
+
+    monkeypatch.setattr(cli_mod, "ChallengeSwarm", boom)
+
+    runner = CliRunner()
+    runner.invoke(main, ["--files", "/dev/null", "--desc", "test", "--claude", "1"])
+
+    assert called == [True]
 
 
 def test_mutual_exclusion():
