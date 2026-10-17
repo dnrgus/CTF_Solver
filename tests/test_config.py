@@ -10,7 +10,7 @@ def test_default_settings():
     assert s.sandbox_image == "ctf-sandbox"
     assert s.sandbox_memory == "4g"
     assert s.sandbox_cpus == 2
-    assert s.timeout == 600
+    assert s.timeout == 86400  # effectively unbounded — max_cost/max_steps/max_bumps are the real limits
     assert s.max_steps == 100
     assert s.max_cost == 10.0
     assert s.flag_pattern == r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"

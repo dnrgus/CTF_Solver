@@ -101,7 +101,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--zai", "zai_count", default=None, type=int, help="Number of z.ai solvers")
 @click.option("--coordinator", default=None, help="Coordinator provider")
 @click.option("--no-coordinator", is_flag=True, help="Disable coordinator")
-@click.option("--timeout", default=None, type=int, help="Max seconds per challenge")
+@click.option("--timeout", default=None, type=int, help="Max seconds per challenge (default: effectively unbounded — --max-cost/--max-steps/--max-bumps are the real limits)")
 @click.option("--max-steps", default=None, type=int, help="Max tool calls per solver")
 @click.option("--max-cost", default=None, type=float, help="Max USD cost")
 @click.option("--flag-pattern", default=None, help="Regex for flag extraction")

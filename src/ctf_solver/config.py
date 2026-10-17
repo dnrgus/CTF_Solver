@@ -64,7 +64,15 @@ class Settings(BaseSettings):
     no_docker: bool = False
 
     # Limits
-    timeout: int = 600
+    # No per-challenge wall-clock cap by default — matches verialabs' own
+    # "solvers never give up" design this project is based on; yakisoba's
+    # own spec had baked in a hard 600s default that cuts a solver off mid
+    # -exploit regardless of real progress (confirmed live: a genuine,
+    # on-track OT/Modbus exploit got killed by this at the 10-minute mark).
+    # --max-cost/--max-steps/--max-bumps are the real backstops against a
+    # runaway solver; this is only a last-resort ceiling, not a working
+    # limit anyone should expect to hit.
+    timeout: int = 86400  # 24h
     max_steps: int = 100
     max_cost: float = 10.0
     flag_pattern: str = r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"
