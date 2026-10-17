@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 import signal
 import sys
@@ -46,6 +47,28 @@ def _auto_discover_files(cwd: Path) -> list[str]:
         elif p.is_dir() and p.name in _SKIP_DIR_NAMES:
             continue
     return out
+
+
+_WINDOWS_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/]")
+
+
+def _normalize_path_input(raw: str) -> str:
+    """Make a pasted path usable, however Windows/WSL mangled it on the way in.
+
+    Handles: wrapping quotes (Explorer's "Copy as path" adds them), a Windows
+    drive path (``C:\\...`` -> ``/mnt/c/...``, the WSL mount convention), and
+    stray backslashes as path separators. A plain WSL/Linux path passes
+    through unchanged.
+    """
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        raw = raw[1:-1].strip()
+    m = _WINDOWS_DRIVE_RE.match(raw)
+    if m:
+        drive = m.group(1).lower()
+        rest = raw[m.end():].replace("\\", "/")
+        return f"/mnt/{drive}/{rest}"
+    return raw.replace("\\", "/")
 
 
 def _prompt_or_x(label: str) -> str:
@@ -216,9 +239,11 @@ def main(
     bare_mode = not challenge_dir and not files and not desc and not resume_state
     if bare_mode:
         raw_dir = click.prompt("분석할 문제 폴더 경로", default=str(Path.cwd()), show_default=True)
-        target_dir = Path(raw_dir).expanduser().resolve()
+        normalized_dir = _normalize_path_input(raw_dir)
+        target_dir = Path(normalized_dir).expanduser().resolve()
         if not target_dir.is_dir():
-            console.print(f"[red]Error: 존재하지 않는 폴더입니다: {target_dir}[/red]")
+            hint = f" (입력: {raw_dir!r} -> {normalized_dir!r})" if normalized_dir != raw_dir.strip() else ""
+            console.print(f"[red]Error: 존재하지 않는 폴더입니다: {target_dir}{hint}[/red]")
             sys.exit(1)
         auto_files = _auto_discover_files(target_dir)
         names = ", ".join(Path(f).name for f in auto_files) or "(없음)"

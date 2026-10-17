@@ -153,3 +153,65 @@ def test_prompt_or_x_real_text_passes_through(monkeypatch):
 
     monkeypatch.setattr(click, "prompt", lambda *a, **k: "  nc 1.2.3.4 1337  ")
     assert _prompt_or_x("원격 서버") == "nc 1.2.3.4 1337"
+
+
+# --------------------------------------------------------------------------- #
+# _normalize_path_input — pasted Windows/WSL paths
+# --------------------------------------------------------------------------- #
+def test_normalize_path_strips_double_quotes():
+    from ctf_solver.cli import _normalize_path_input
+
+    assert _normalize_path_input('"C:\\Users\\x\\chall"') == "/mnt/c/Users/x/chall"
+
+
+def test_normalize_path_strips_single_quotes():
+    from ctf_solver.cli import _normalize_path_input
+
+    assert _normalize_path_input("'/home/x/chall'") == "/home/x/chall"
+
+
+def test_normalize_path_windows_drive_to_wsl_mount():
+    from ctf_solver.cli import _normalize_path_input
+
+    assert _normalize_path_input(r"C:\Users\dnrgu\Desktop\chall") == "/mnt/c/Users/dnrgu/Desktop/chall"
+
+
+def test_normalize_path_lowercase_drive_letter():
+    from ctf_solver.cli import _normalize_path_input
+
+    assert _normalize_path_input(r"c:\foo") == "/mnt/c/foo"
+
+
+def test_normalize_path_plain_wsl_path_passthrough():
+    from ctf_solver.cli import _normalize_path_input
+
+    assert _normalize_path_input("/mnt/c/Users/x/chall") == "/mnt/c/Users/x/chall"
+
+
+def test_bare_invocation_pasted_windows_path_with_quotes(tmp_path, monkeypatch):
+    """Reproduces the exact failure: a Windows path pasted with quotes and
+    backslashes, from a WSL prompt, must resolve to the real /mnt/c/... dir."""
+    monkeypatch.chdir(tmp_path)
+    # Simulate "C:\...\battle_ctf\20_PWN_003" by using whatever drive /mnt/c
+    # actually maps to in this environment, so the directory genuinely exists.
+    import pathlib
+
+    mnt_c = pathlib.Path("/mnt/c")
+    if not mnt_c.is_dir():
+        import pytest
+
+        pytest.skip("no /mnt/c in this environment")
+    chall = mnt_c / "ctf_solver_test_tmp_20_PWN_003"
+    chall.mkdir(exist_ok=True)
+    (chall / "notes").write_bytes(b"x")
+    try:
+        windows_style = '"C:\\ctf_solver_test_tmp_20_PWN_003"'
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["--claude", "1", "--dry-run"], input=f"{windows_style}\nX\nX\n"
+        )
+        assert result.exit_code == 0, result.output
+        assert "notes" in result.output
+    finally:
+        (chall / "notes").unlink(missing_ok=True)
+        chall.rmdir()
