@@ -13,6 +13,8 @@ from ctf_solver.collaboration.message_bus import ChallengeMessageBus
 from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.providers import get_provider
 from ctf_solver.providers.base import SolverSession
+from ctf_solver.providers.codex import locate_codex_native_bin_dir
+from ctf_solver.sandbox.docker import DockerSandbox
 from ctf_solver.tracking.cost_tracker import CostTracker
 
 if TYPE_CHECKING:
@@ -37,6 +39,7 @@ class CoordinatorAgent:
     _task: asyncio.Task | None = None
     _hint_queue: asyncio.Queue | None = None
     _hint_task: asyncio.Task | None = None
+    _sandbox: DockerSandbox | None = None
 
     async def start(self) -> None:
         provider = get_provider(self.provider_name)
@@ -44,16 +47,58 @@ class CoordinatorAgent:
         if not provider.validate_config(config):
             logger.warning("Coordinator provider %s not configured — coordinator disabled", self.provider_name)
             return
+        # The coordinator passes tools=[] (it only ever sends plain-text trace
+        # summaries, never a tool_result) — but for Codex that does NOT mean
+        # "no execution capability": its own native agent tooling (separate
+        # from this project's dynamicTools) is available regardless of the
+        # dynamicTools list, confirmed live by this project's solver path
+        # having the exact same issue. So the coordinator needs its own
+        # confining sandbox exactly like a solver instance does, not just an
+        # empty tool list, whenever Docker is available to provide one.
+        if self.provider_name == "codex" and not self.settings.no_docker:
+            await self._start_codex_sandbox()
         self.session = await provider.create_session(
             solver_id="coordinator",
             system_prompt="You are a CTF coordinator. Read solver traces and provide strategic guidance.",
             tools=[],
             config=config,
+            sandbox=self._sandbox,
         )
         self._task = asyncio.create_task(self._coordination_loop())
         self._hint_queue = self.event_bus.subscribe()
         self._hint_task = asyncio.create_task(self._relay_hints())
         logger.info("Coordinator started with %s", self.provider_name)
+
+    async def _start_codex_sandbox(self) -> None:
+        """Give the coordinator's own codex session a confining container,
+        mirroring swarm.py's per-solver setup (see providers/codex.py's
+        containment comments for why this is required at all)."""
+        challenge_dir = self.swarm.challenge_dir if self.swarm else "."
+        bin_dir = locate_codex_native_bin_dir()
+        extra_ro_binds = [f"{bin_dir}:/opt/codex-bin:ro"] if bin_dir else []
+        sandbox = DockerSandbox(
+            image=self.settings.sandbox_image,
+            challenge_dir=challenge_dir,
+            memory_limit=self.settings.sandbox_memory,
+            cpu_limit=self.settings.sandbox_cpus,
+            extra_ro_binds=extra_ro_binds,
+        )
+        try:
+            await sandbox.start()
+        except Exception as e:
+            logger.warning("Coordinator sandbox failed to start (%s) — coordinator disabled", e)
+            return
+        if not self.settings.openai_api_key and sandbox.workspace_dir:
+            host_auth = Path.home() / ".codex" / "auth.json"
+            codex_home = Path(sandbox.workspace_dir) / ".codex-home"
+            codex_home.mkdir(exist_ok=True)
+            if host_auth.exists():
+                import shutil
+
+                dest = codex_home / "auth.json"
+                shutil.copy2(host_auth, dest)
+                dest.chmod(0o600)
+        self._sandbox = sandbox
 
     async def _coordination_loop(self) -> None:
         while True:
@@ -145,4 +190,10 @@ class CoordinatorAgent:
                 pass
         if self.session:
             await self.session.close()
+        if self._sandbox:
+            try:
+                await self._sandbox.stop()
+            except Exception:
+                pass
+            self._sandbox = None
         logger.info("Coordinator stopped")

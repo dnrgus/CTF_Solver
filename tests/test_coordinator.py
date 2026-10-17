@@ -319,3 +319,125 @@ def test_coordinator_factory_defaults_to_first_active_provider():
 
     s = Settings(claude_count=1, codex_count=2)
     assert get_coordinator_provider(s) == "claude"
+
+
+# --------------------------------------------------------------------------- #
+# Codex containment: the coordinator's own codex session must be confined to
+# a Docker sandbox exactly like a solver's — its tools=[] did NOT disable
+# codex's own native agent tooling (confirmed live: a bare, unsandboxed
+# coordinator session read real host files). See providers/codex.py's
+# containment comments and solver/swarm.py's equivalent per-solver wiring.
+# --------------------------------------------------------------------------- #
+class _FakeCodexSandbox:
+    def __init__(self, workspace_root: str = "", **kwargs) -> None:
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        self._workspace_root = workspace_root
+        self.workspace_dir = ""
+        self.container_id = "fake-coordinator-container"
+
+    async def start(self) -> None:
+        self.started = True
+        self.workspace_dir = self._workspace_root
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_codex_coordinator_gets_its_own_sandbox(monkeypatch, tmp_path):
+    provider = MockProvider(scripts={"coordinator": []})
+    monkeypatch.setattr(coordinator_mod, "get_provider", lambda name: provider)
+    monkeypatch.setattr(coordinator_mod, "locate_codex_native_bin_dir", lambda: "/fake/codex-bin")
+    created: list[_FakeCodexSandbox] = []
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    def _fake_sandbox_ctor(**kwargs):
+        sb = _FakeCodexSandbox(workspace_root=str(workspace_root), **kwargs)
+        created.append(sb)
+        return sb
+
+    monkeypatch.setattr(coordinator_mod, "DockerSandbox", _fake_sandbox_ctor)
+    monkeypatch.setattr(coordinator_mod.Path, "home", lambda: tmp_path)  # no real ~/.codex/auth.json
+
+    coordinator = CoordinatorAgent(
+        provider_name="codex",
+        settings=Settings(codex_count=1, no_docker=False),
+        event_bus=EventBus(),
+        cost_tracker=coordinator_mod.CostTracker(),
+        message_bus=ChallengeMessageBus(),
+    )
+
+    await coordinator.start()
+    try:
+        assert len(created) == 1
+        assert created[0].started is True
+        assert created[0].kwargs["extra_ro_binds"] == ["/fake/codex-bin:/opt/codex-bin:ro"]
+        assert coordinator.session.sandbox is created[0]
+    finally:
+        await coordinator.stop()
+
+    assert created[0].stopped is True
+
+
+async def test_codex_coordinator_no_sandbox_in_no_docker_mode(monkeypatch):
+    """--no-docker is already gated behind its own explicit danger prompt
+    elsewhere — the coordinator must not try to build a container there."""
+    provider = MockProvider(scripts={"coordinator": []})
+    monkeypatch.setattr(coordinator_mod, "get_provider", lambda name: provider)
+    called = []
+    monkeypatch.setattr(
+        coordinator_mod, "DockerSandbox", lambda **kw: called.append(1) or _FakeCodexSandbox(**kw)
+    )
+
+    coordinator = CoordinatorAgent(
+        provider_name="codex",
+        settings=Settings(codex_count=1, no_docker=True),
+        event_bus=EventBus(),
+        cost_tracker=coordinator_mod.CostTracker(),
+        message_bus=ChallengeMessageBus(),
+    )
+
+    await coordinator.start()
+    try:
+        assert called == []
+        assert coordinator._sandbox is None
+    finally:
+        await coordinator.stop()
+
+
+async def test_non_codex_coordinator_never_builds_a_sandbox(monkeypatch):
+    provider = MockProvider(scripts={"coordinator": []})
+    monkeypatch.setattr(coordinator_mod, "get_provider", lambda name: provider)
+    called = []
+    monkeypatch.setattr(
+        coordinator_mod, "DockerSandbox", lambda **kw: called.append(1) or _FakeCodexSandbox(**kw)
+    )
+
+    coordinator = CoordinatorAgent(
+        provider_name="mock",
+        settings=Settings(claude_count=1, no_docker=False),
+        event_bus=EventBus(),
+        cost_tracker=coordinator_mod.CostTracker(),
+        message_bus=ChallengeMessageBus(),
+    )
+
+    await coordinator.start()
+    try:
+        assert called == []
+    finally:
+        await coordinator.stop()
+
+
+def test_codex_session_empty_tools_means_empty_dynamic_tools():
+    """The coordinator's tools=[] must actually reach codex as an empty
+    dynamicTools list, not the full bash-capable SANDBOX_TOOLS — a separate,
+    defense-in-depth fix alongside the sandbox (codex's own native tooling
+    isn't gated by dynamicTools, but there is no reason to ALSO hand it ours)."""
+    from ctf_solver.providers.codex import CodexSession
+
+    with_tools = CodexSession("s", "p", [object()], {})
+    without_tools = CodexSession("s", "p", [], {})
+    assert with_tools._tools
+    assert not without_tools._tools
