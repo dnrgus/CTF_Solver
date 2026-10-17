@@ -2,7 +2,42 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings
+
+# yakisoba's own hardcoded default. Still used whenever an OPENAI_API_KEY is
+# configured — fine for a billed API key, which accepts arbitrary model ids.
+_API_KEY_DEFAULT_CODEX_MODEL = "gpt-5.4"
+
+
+def _codex_cli_config_model() -> str | None:
+    """Whatever `~/.codex/config.toml`'s own `model =` line already says.
+
+    That's the model the user's `codex` CLI uses every day, so a ChatGPT/Codex
+    subscription login (ANTHROPIC_API_KEY/OPENAI_API_KEY not set) is already
+    known to accept it — unlike the hardcoded "gpt-5.4" default, which a
+    ChatGPT-plan login rejects outright.
+    """
+    cfg = Path.home() / ".codex" / "config.toml"
+    if not cfg.exists():
+        return None
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("model") and "=" in line and not line.startswith("model_"):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def _default_codex_model() -> str:
+    """Only a *default* — CODEX_MODEL env var, `--config` TOML, or any other
+    explicit setting still always wins; this factory never runs when one of
+    those supplies the field."""
+    if os.environ.get("OPENAI_API_KEY"):
+        return _API_KEY_DEFAULT_CODEX_MODEL
+    return _codex_cli_config_model() or _API_KEY_DEFAULT_CODEX_MODEL
 
 
 class Settings(BaseSettings):
@@ -12,7 +47,7 @@ class Settings(BaseSettings):
     zai_api_key: str = ""
     zai_endpoint: str = "https://api.z.ai/api/paas/v4/"
     claude_model: str = "claude-opus-4-6-20250612"
-    codex_model: str = "gpt-5.4"
+    codex_model: str = Field(default_factory=_default_codex_model)
     zai_model: str = "glm-5.1"
 
     # Provider counts (set via CLI, not env)
