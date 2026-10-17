@@ -173,6 +173,7 @@ class CodexSession(SolverSession):
         self._solver_id = solver_id
         self._config = config
         self._system_prompt = system_prompt
+        self._tools = tools
         self._sandbox = sandbox
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
@@ -261,7 +262,13 @@ class CodexSession(SolverSession):
                 "cwd": thread_cwd,
                 "approvalPolicy": approval_policy,
                 "sandbox": sandbox_mode,
-                "dynamicTools": SANDBOX_TOOLS,
+                # Respect an explicitly empty tools list (the coordinator's
+                # text-only role) instead of always handing out bash etc. —
+                # codex's own native agent tooling is a separate concern
+                # (see this method's containment comments above) that this
+                # does NOT disable, but there is no reason to also hand it
+                # OUR dynamicTools when the caller asked for none.
+                "dynamicTools": SANDBOX_TOOLS if self._tools else [],
             },
         )
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id")
