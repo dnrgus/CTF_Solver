@@ -38,6 +38,11 @@ class DockerSandbox:
     memory_limit: str = "4g"
     cpu_limit: int = 2
     workspace_dir: str = ""
+    # Extra "host:container:ro" bind-mount strings, appended after the normal
+    # workspace/distfiles binds. Used to confine a provider's own native agent
+    # process (e.g. codex app-server) to this container instead of the host —
+    # see providers/codex.py and solver/swarm.py's _locate_codex_native_bin_dir.
+    extra_ro_binds: list[str] = field(default_factory=list)
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -78,6 +83,7 @@ class DockerSandbox:
             binds: list[str] = [f"{self.workspace_dir}:/challenge/workspace:rw"]
             if Path(distfiles).exists():
                 binds.append(f"{distfiles}:/challenge/distfiles:ro")
+            binds.extend(self.extra_ro_binds)
             config = {
                 "Image": self.image,
                 "Cmd": ["sleep", "infinity"],

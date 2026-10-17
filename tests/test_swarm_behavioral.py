@@ -6,6 +6,7 @@ import asyncio
 
 from conftest import FakeSandbox, MockProvider, resp, tool
 
+import ctf_solver.solver.swarm as swarm_mod
 from ctf_solver.config import Settings
 from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.session_state import SessionState, SolverState
@@ -377,3 +378,88 @@ async def test_empty_connection_info_skips_service_section(tmp_path, patch_backe
     prompt = provider.sessions["claude-0"].system_prompt
     assert "FIRST ACTION REQUIRED" not in prompt
     assert "## Service Connection" not in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Codex containment wiring — see providers/codex.py's containment comments
+# for why this exists (a live, unconfined codex native-agent run read files
+# outside the intended sandbox on the first real use of this provider).
+# --------------------------------------------------------------------------- #
+def test_create_solvers_codex_gets_extra_ro_binds_when_native_bin_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarm_mod, "locate_codex_native_bin_dir", lambda: "/fake/codex-bin")
+    swarm = _swarm(tmp_path, codex_count=1, no_docker=False)
+
+    instances = swarm._create_solvers()
+
+    assert instances[0].sandbox.extra_ro_binds == ["/fake/codex-bin:/opt/codex-bin:ro"]
+
+
+def test_create_solvers_codex_no_extra_binds_when_native_bin_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(swarm_mod, "locate_codex_native_bin_dir", lambda: None)
+    swarm = _swarm(tmp_path, codex_count=1, no_docker=False)
+
+    instances = swarm._create_solvers()
+
+    assert instances[0].sandbox.extra_ro_binds == []
+
+
+def test_create_solvers_claude_gets_no_extra_binds(tmp_path, monkeypatch):
+    """Only codex instances ever get the extra bind — other providers never
+    call locate_codex_native_bin_dir at all."""
+    called = []
+    monkeypatch.setattr(
+        swarm_mod, "locate_codex_native_bin_dir",
+        lambda: called.append(1) or "/fake/codex-bin",
+    )
+    swarm = _swarm(tmp_path, claude_count=1, no_docker=False)
+
+    instances = swarm._create_solvers()
+
+    assert instances[0].sandbox.extra_ro_binds == []
+    assert called == []
+
+
+def test_prepare_codex_subscription_home_copies_auth_json(tmp_path, monkeypatch):
+    fake_home = tmp_path / "fakehome"
+    (fake_home / ".codex").mkdir(parents=True)
+    (fake_home / ".codex" / "auth.json").write_text('{"token": "secret"}')
+    monkeypatch.setattr(swarm_mod.Path, "home", lambda: fake_home)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inst = SolverInstance(
+        solver_id="codex-0", provider_name="codex", model_spec="gpt-5.6-sol",
+        sandbox=_FakeSandboxWithWorkspace(str(workspace)),
+    )
+
+    ChallengeSwarm._prepare_codex_subscription_home(inst)
+
+    copied = workspace / ".codex-home" / "auth.json"
+    assert copied.read_text() == '{"token": "secret"}'
+    assert oct(copied.stat().st_mode)[-3:] == "600"
+
+
+def test_prepare_codex_subscription_home_no_host_auth_still_creates_dir(tmp_path, monkeypatch):
+    """No ~/.codex/auth.json (never logged in) -> CODEX_HOME dir still exists
+    (empty) so the containerized codex process has somewhere to point at,
+    rather than failing before it can even report a clear auth error."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setattr(swarm_mod.Path, "home", lambda: fake_home)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inst = SolverInstance(
+        solver_id="codex-0", provider_name="codex", model_spec="gpt-5.6-sol",
+        sandbox=_FakeSandboxWithWorkspace(str(workspace)),
+    )
+
+    ChallengeSwarm._prepare_codex_subscription_home(inst)
+
+    assert (workspace / ".codex-home").is_dir()
+    assert not (workspace / ".codex-home" / "auth.json").exists()
+
+
+class _FakeSandboxWithWorkspace:
+    def __init__(self, workspace_dir: str) -> None:
+        self.workspace_dir = workspace_dir

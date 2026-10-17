@@ -157,6 +157,7 @@ class ClaudeProvider(ProviderBase):
         return bool(config.get("anthropic_api_key", ""))
 
     async def create_session(
-        self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict
+        self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict,
+        sandbox: object | None = None,
     ) -> ClaudeSession:
         return ClaudeSession(solver_id, system_prompt, tools, config)

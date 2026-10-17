@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from typing import Any
 
 from ctf_solver.providers.base import (
     ProviderBase,
@@ -21,6 +22,47 @@ from ctf_solver.providers.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+def locate_codex_native_bin_dir() -> str | None:
+    """Find the directory holding the `codex` CLI's native, statically-linked
+    binaries (`codex` + its `codex-code-mode-host` sibling), so they can be
+    bind-mounted read-only into a Docker sandbox and run confined to it
+    instead of directly on the host.
+
+    Without this, `codex`'s own agentic loop has native tool-use/sub-agent
+    capabilities entirely separate from this project's dynamicTools — with
+    read access to the whole real filesystem under its default sandbox modes
+    — that this project's Docker sandbox never confines (confirmed against a
+    live `codex app-server`: it read arbitrary files outside the intended
+    sandbox on the first live run of this provider). Returns None if nothing
+    matching the expected npm-package layout (or a plain standalone native
+    binary) is found; the caller must NOT fall back to running codex
+    unconfined on the host in that case.
+    """
+    exe = shutil.which("codex")
+    if not exe:
+        return None
+    resolved = Path(exe).resolve()
+    # npm's JS-shim layout: <pkg>/bin/codex.js execs a platform package's
+    # node_modules/@openai/codex-<platform>/vendor/<rust-target-triple>/bin/codex.
+    for parent in list(resolved.parents)[:4]:
+        for candidate in sorted(parent.glob("node_modules/@openai/codex-*/vendor/*/bin/codex")):
+            if (candidate.parent / "codex-code-mode-host").exists():
+                return str(candidate.parent)
+    # Already a native, statically-linked binary (non-npm install) — use its
+    # own directory, but only if its sibling helper is right there too.
+    if _is_elf(resolved) and (resolved.parent / "codex-code-mode-host").exists():
+        return str(resolved.parent)
+    return None
+
+
+def _is_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
 
 SANDBOX_TOOLS = [
     {
@@ -124,10 +166,14 @@ SANDBOX_TOOLS = [
 
 
 class CodexSession(SolverSession):
-    def __init__(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> None:
+    def __init__(
+        self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict,
+        sandbox: Any | None = None,
+    ) -> None:
         self._solver_id = solver_id
         self._config = config
         self._system_prompt = system_prompt
+        self._sandbox = sandbox
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
         self._msg_id = 0
@@ -140,13 +186,58 @@ class CodexSession(SolverSession):
         self._turn_done_event = asyncio.Event()
         self._pending_context: str | None = None
 
+    # In-container paths where swarm.py's extra_ro_binds mounts the native
+    # codex binaries, and where the workspace bind gives us a writable spot
+    # for an ephemeral CODEX_HOME (copied auth.json only — never the real
+    # ~/.codex, which also holds unrelated session history/notes/etc).
+    _CONTAINER_BIN = "/opt/codex-bin/codex"
+    _CONTAINER_CODEX_HOME = "/challenge/workspace/.codex-home"
+
+    def _sandboxed(self) -> bool:
+        """True when a real (Docker) sandbox is attached, not HostSandbox's
+        "host" sentinel or no sandbox at all."""
+        if self._sandbox is None:
+            return False
+        return getattr(self._sandbox, "container_id", "host") not in ("", "host")
+
     async def _start_process(self) -> None:
-        env = {**os.environ}
-        if self._config.get("openai_api_key"):
-            env["OPENAI_API_KEY"] = self._config["openai_api_key"]
+        sandboxed = self._sandboxed()
+        api_key = self._config.get("openai_api_key")
+
+        if sandboxed:
+            # Run codex app-server's own process INSIDE the same Docker
+            # sandbox as the dynamicTools bash redirect, instead of on the
+            # host. codex's native agent tooling (its own command execution,
+            # sub-agents) is entirely separate from this project's
+            # dynamicTools and is NOT confined by this project's sandbox on
+            # its own — confirmed live: with no containment it read files
+            # outside the intended sandbox (see locate_codex_native_bin_dir's
+            # docstring). Inside the container, "danger-full-access" to that
+            # process only ever means the container's own filesystem.
+            cmd = ["docker", "exec", "-i"]
+            if api_key:
+                cmd += ["-e", "OPENAI_API_KEY"]  # pulled from this env=, not argv
+            cmd += [
+                "-e", f"CODEX_HOME={self._CONTAINER_CODEX_HOME}",
+                self._sandbox.container_id, self._CONTAINER_BIN, "app-server",
+            ]
+            env = {**os.environ}
+            if api_key:
+                env["OPENAI_API_KEY"] = api_key
+            thread_cwd = "/challenge"
+            approval_policy = "never"
+            sandbox_mode = "danger-full-access"
+        else:
+            cmd = ["codex", "app-server"]
+            env = {**os.environ}
+            if api_key:
+                env["OPENAI_API_KEY"] = api_key
+            thread_cwd = "."
+            approval_policy = "on-request"
+            sandbox_mode = "read-only"
+
         self._proc = await asyncio.create_subprocess_exec(
-            "codex",
-            "app-server",
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -167,9 +258,9 @@ class CodexSession(SolverSession):
                 "model": self._config.get("codex_model", "gpt-5.4"),
                 "personality": "pragmatic",
                 "baseInstructions": self._system_prompt,
-                "cwd": ".",
-                "approvalPolicy": "on-request",
-                "sandbox": "read-only",
+                "cwd": thread_cwd,
+                "approvalPolicy": approval_policy,
+                "sandbox": sandbox_mode,
                 "dynamicTools": SANDBOX_TOOLS,
             },
         )
@@ -337,16 +428,44 @@ class CodexSession(SolverSession):
         return SolverResponse(text=self._text_buffer, tool_calls=tool_calls, usage=self._usage, done=done)
 
     async def _drain_turn(self) -> list[ToolCall]:
-        """Read queued items until the model emits a tool-call batch or the turn
-        completes. Shared by the new-turn and tool-result continuation paths."""
+        """Read queued items until the turn completes or at least one tool
+        call is ready to hand back. Shared by the new-turn and tool-result
+        continuation paths.
+
+        A live `codex app-server` was confirmed (by direct JSON-RPC trace) to
+        emit exactly ONE `item/tool/call` and then pause — waiting for our
+        RPC response — rather than batching several before pausing. The
+        previous version of this method kept blocking on queue.get() after
+        that first call, waiting for a second item that never arrives until
+        we answer the first one: a real deadlock (the model waits on us, we
+        wait on it), which in practice only ever resolved via the swarm's
+        outer per-call timeout — burning the whole turn budget on every
+        single tool call. So: return as soon as the queue has yielded at
+        least one ToolCall, draining any more that happen to already be
+        queued (non-blocking) in case a future/alternate codex build does
+        batch them, but never blocking further for one that isn't there yet.
+        """
         tool_calls: list[ToolCall] = []
         while not self._turn_done_event.is_set():
             item = await self._tool_call_queue.get()
             if item is None:
-                break
+                return tool_calls
             tool_calls.append(item)
-        # If turn/completed landed before/while we drained, sweep any tool calls
-        # queued ahead of the None sentinel so they are not stranded (TOCTOU).
+            # Give an already-in-flight completion signal for THIS SAME turn
+            # (e.g. turn/completed landing right after this tool call) one
+            # scheduler tick to arrive, so its None sentinel doesn't leak
+            # into a future _drain_turn() call and get mistaken there for an
+            # instant "nothing more to do" on an unrelated later turn.
+            await asyncio.sleep(0)
+            while not self._tool_call_queue.empty():
+                nxt = self._tool_call_queue.get_nowait()
+                if nxt is None:
+                    return tool_calls
+                tool_calls.append(nxt)
+            return tool_calls
+        # Turn already completed before we even started draining — sweep
+        # whatever tool calls are queued ahead of the None sentinel so they
+        # are not stranded (TOCTOU with _read_loop setting the event).
         while not self._tool_call_queue.empty():
             item = self._tool_call_queue.get_nowait()
             if item is not None:
@@ -382,5 +501,8 @@ class CodexProvider(ProviderBase):
         # only checks that *something* is logged in, not that it is still valid.
         return shutil.which("codex") is not None and (Path.home() / ".codex" / "auth.json").exists()
 
-    async def create_session(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> CodexSession:
-        return CodexSession(solver_id, system_prompt, tools, config)
+    async def create_session(
+        self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict,
+        sandbox: Any | None = None,
+    ) -> CodexSession:
+        return CodexSession(solver_id, system_prompt, tools, config, sandbox=sandbox)

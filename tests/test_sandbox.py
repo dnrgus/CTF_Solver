@@ -72,3 +72,66 @@ async def test_missing_image_error():
     sandbox = DockerSandbox(image="nonexistent-image-xyz:latest", challenge_dir="/tmp")
     with pytest.raises(RuntimeError, match="not found"):
         await sandbox.start()
+
+
+# --------------------------------------------------------------------------- #
+# extra_ro_binds — used to confine a provider's own native process (codex)
+# inside the container instead of the host; see providers/codex.py.
+# --------------------------------------------------------------------------- #
+class _FakeContainer:
+    def __init__(self, container_id: str = "fakecontainerid") -> None:
+        self.id = container_id
+
+    async def start(self) -> None:
+        pass
+
+
+class _FakeContainers:
+    def __init__(self) -> None:
+        self.created_config: dict | None = None
+
+    async def create(self, config: dict) -> _FakeContainer:
+        self.created_config = config
+        return _FakeContainer()
+
+
+class _FakeDocker:
+    def __init__(self) -> None:
+        self.containers = _FakeContainers()
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_extra_ro_binds_included_in_container_config(monkeypatch, tmp_path):
+    import ctf_solver.sandbox.docker as docker_mod
+
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr(docker_mod.aiodocker, "Docker", lambda: fake_docker)
+
+    sandbox = DockerSandbox(
+        image="ctf-sandbox",
+        challenge_dir=str(tmp_path),
+        extra_ro_binds=["/host/codex-bin:/opt/codex-bin:ro"],
+    )
+    await sandbox.start()
+
+    binds = fake_docker.containers.created_config["HostConfig"]["Binds"]
+    assert "/host/codex-bin:/opt/codex-bin:ro" in binds
+    # Still after the normal workspace bind, not replacing it.
+    assert any(b.endswith(":/challenge/workspace:rw") for b in binds)
+
+
+@pytest.mark.asyncio
+async def test_no_extra_ro_binds_by_default(monkeypatch, tmp_path):
+    import ctf_solver.sandbox.docker as docker_mod
+
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr(docker_mod.aiodocker, "Docker", lambda: fake_docker)
+
+    sandbox = DockerSandbox(image="ctf-sandbox", challenge_dir=str(tmp_path))
+    await sandbox.start()
+
+    binds = fake_docker.containers.created_config["HostConfig"]["Binds"]
+    assert not any("codex" in b for b in binds)
