@@ -463,3 +463,85 @@ def test_prepare_codex_subscription_home_no_host_auth_still_creates_dir(tmp_path
 class _FakeSandboxWithWorkspace:
     def __init__(self, workspace_dir: str) -> None:
         self.workspace_dir = workspace_dir
+
+
+# --------------------------------------------------------------------------- #
+# Long-running-call watchdog and clearer timeout error messages — a Codex
+# turn can block for a long time inside the provider's own native tool use
+# (invisible to this system's trace) rather than ours; see providers/codex.py
+# containment comments. Live-confirmed: this previously logged as the
+# useless "LLM call failed: " (str(TimeoutError()) is empty).
+# --------------------------------------------------------------------------- #
+async def test_llm_call_failure_logs_exception_type_not_just_blank_message(tmp_path, patch_backends, caplog):
+    class _BoomSession:
+        system_prompt = ""
+        sandbox = None
+
+        async def send(self, message, tool_results=None):
+            raise TimeoutError
+
+        async def inject_context(self, text):
+            pass
+
+        async def close(self):
+            pass
+
+    class _BoomProvider(MockProvider):
+        async def create_session(self, *a, **kw):
+            return _BoomSession()
+
+    patch_backends(_BoomProvider())
+    swarm = _swarm(tmp_path, claude_count=1)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await swarm.run()
+
+    assert any("TimeoutError" in r.message for r in caplog.records)
+
+
+async def test_watchdog_warns_on_a_long_running_call(tmp_path, patch_backends, monkeypatch, caplog):
+    monkeypatch.setattr(swarm_mod, "LONG_CALL_WARN_INTERVAL", 0.05)
+
+    class _SlowSession:
+        system_prompt = ""
+        sandbox = None
+
+        async def send(self, message, tool_results=None):
+            await asyncio.sleep(0.3)
+            return resp(tool_calls=[tool("submit_flag", flag="FLAG{slow}")])
+
+        async def inject_context(self, text):
+            pass
+
+        async def close(self):
+            pass
+
+    class _SlowProvider(MockProvider):
+        async def create_session(self, *a, **kw):
+            return _SlowSession()
+
+    patch_backends(_SlowProvider())
+    swarm = _swarm(tmp_path, claude_count=1, timeout=10)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await swarm.run()
+
+    assert any("still running" in r.message for r in caplog.records)
+
+
+async def test_watchdog_does_not_warn_on_a_fast_call(tmp_path, patch_backends, monkeypatch, caplog):
+    monkeypatch.setattr(swarm_mod, "LONG_CALL_WARN_INTERVAL", 5)
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="FLAG{fast}")])]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, claude_count=1)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        await swarm.run()
+
+    assert not any("still running" in r.message for r in caplog.records)

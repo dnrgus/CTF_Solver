@@ -76,3 +76,10 @@ def test_category_tips_alias_is_exact_match():
     assert _category_tips("forensic") == _category_tips("forensics")
     assert "volatility3" in " ".join(_category_tips("forensic"))
     assert _category_tips("totallyunknown") == []
+
+
+def test_prompt_instructs_bash_only_and_network_timeouts():
+    meta = ChallengeMeta(name="n", category="pwn", description="d")
+    prompt = build_prompt(meta, [])
+    assert "`bash` tool" in prompt
+    assert "timeout" in prompt.lower()

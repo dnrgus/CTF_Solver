@@ -241,6 +241,11 @@ def build_prompt(
         "7. Do not guess a flag and do not stop to ask questions — cover maximum surface area:",
         "   hidden files, env vars, backups, HTTP headers, error messages, timing, encoding tricks.",
         "   Pwn over nc: `stty raw -echo` before launching vulnerable binaries.",
+        "8. Always run commands through the `bash` tool, not any other execution mechanism —",
+        "   that is the only path whose output and timing this system can see and bound.",
+        "9. Any script that touches the network MUST set an explicit timeout on every blocking",
+        "   call (e.g. pwntools `context.timeout=10` or per-call `timeout=`, socket `settimeout()`).",
+        "   A remote that never responds must not hang your script forever.",
     ]
 
     if harness.strip():
