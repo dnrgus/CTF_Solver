@@ -175,5 +175,8 @@ class ZAIProvider(ProviderBase):
     def validate_config(self, config: dict) -> bool:
         return bool(config.get("zai_api_key", ""))
 
-    async def create_session(self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict) -> ZAISession:
+    async def create_session(
+        self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict,
+        sandbox: object | None = None,
+    ) -> ZAISession:
         return ZAISession(solver_id, system_prompt, tools, config)

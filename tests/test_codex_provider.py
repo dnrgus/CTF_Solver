@@ -146,19 +146,33 @@ class FakeProcess:
 
 @pytest.fixture
 def fake_proc(monkeypatch) -> FakeProcess:
-    """Install a FakeProcess as the result of ``create_subprocess_exec``."""
+    """Install a FakeProcess as the result of ``create_subprocess_exec``.
+
+    Records every call's (args, kwargs) on ``proc.spawn_calls`` so tests can
+    assert on the exact command line used to launch codex (host vs.
+    containerized via ``docker exec``)."""
     proc = FakeProcess()
+    proc.spawn_calls: list[tuple[tuple, dict]] = []
 
     async def fake_create(*args, **kwargs):
+        proc.spawn_calls.append((args, kwargs))
         return proc
 
     monkeypatch.setattr(codex_mod.asyncio, "create_subprocess_exec", fake_create)
     return proc
 
 
-def make_session(**config) -> CodexSession:
+class FakeDockerSandbox:
+    """Minimal stand-in exposing just what CodexSession._sandboxed() and the
+    containerized spawn path need."""
+
+    def __init__(self, container_id: str = "abc123containerid") -> None:
+        self.container_id = container_id
+
+
+def make_session(sandbox=None, **config) -> CodexSession:
     cfg = {"openai_api_key": "sk-test", **config}
-    return CodexSession("solver-1", "system prompt", [], cfg)
+    return CodexSession("solver-1", "system prompt", [], cfg, sandbox=sandbox)
 
 
 async def wait_for_method(proc: FakeProcess, method: str) -> None:
@@ -594,5 +608,185 @@ async def test_drain_turn_strands_toolcall_when_completed_before_drain_starts(fa
     resp = await asyncio.wait_for(task, timeout=TIMEOUT)
     # Correct expectation: the tool call is NOT dropped.
     assert [tc.call_id for tc in resp.tool_calls] == ["call-x"]
+    assert resp.done is False
+    await session.close()
+
+
+# --------------------------------------------------------------------------- #
+# Containment: codex app-server must run INSIDE the Docker sandbox, not on
+# the bare host, whenever one is attached — otherwise its own native agent
+# tooling (separate from this project's dynamicTools) is unconfined. See
+# providers/codex.py's _start_process docstring/comments for the live repro
+# that found this (it read files outside the intended sandbox).
+# --------------------------------------------------------------------------- #
+async def test_no_sandbox_spawns_bare_codex_on_host(fake_proc):
+    session = make_session()  # sandbox=None
+    resp = await drive_turn(session, fake_proc, "go", [])
+    assert resp.done is True
+
+    args, kwargs = fake_proc.spawn_calls[0]
+    assert args == ("codex", "app-server")
+    assert "OPENAI_API_KEY" in kwargs["env"]
+    await session.close()
+
+
+async def test_host_sandbox_sentinel_is_not_treated_as_containerized(fake_proc):
+    """HostSandbox's container_id is the literal string "host" (--no-docker),
+    not a real container — must NOT route through docker exec."""
+    session = make_session(sandbox=FakeDockerSandbox(container_id="host"))
+    await drive_turn(session, fake_proc, "go", [])
+    args, _ = fake_proc.spawn_calls[0]
+    assert args == ("codex", "app-server")
+    await session.close()
+
+
+async def test_docker_sandbox_spawns_codex_via_docker_exec(fake_proc):
+    sandbox = FakeDockerSandbox(container_id="real-container-xyz")
+    session = make_session(sandbox=sandbox)
+    await drive_turn(session, fake_proc, "go", [])
+
+    args, kwargs = fake_proc.spawn_calls[0]
+    assert args[:3] == ("docker", "exec", "-i")
+    assert "real-container-xyz" in args
+    assert args[-2:] == (CodexSession._CONTAINER_BIN, "app-server")
+    assert "-e" in args and "OPENAI_API_KEY" in args  # bare flag, not VAR=value
+    # The actual secret is only ever in this subprocess's own env, never argv.
+    assert kwargs["env"].get("OPENAI_API_KEY") == "sk-test"
+    assert not any("sk-test" in str(a) for a in args)
+    await session.close()
+
+
+async def test_docker_sandbox_thread_start_uses_container_jail_params(fake_proc):
+    sandbox = FakeDockerSandbox()
+    session = make_session(sandbox=sandbox)
+    await drive_turn(session, fake_proc, "go", [])
+
+    thread_start = next(m for m in fake_proc.stdin.written_messages() if m.get("method") == "thread/start")
+    params = thread_start["params"]
+    assert params["sandbox"] == "danger-full-access"
+    assert params["cwd"] == "/challenge"
+    assert params["approvalPolicy"] == "never"
+    await session.close()
+
+
+async def test_host_run_thread_start_keeps_old_read_only_params(fake_proc):
+    session = make_session()  # no sandbox
+    await drive_turn(session, fake_proc, "go", [])
+
+    thread_start = next(m for m in fake_proc.stdin.written_messages() if m.get("method") == "thread/start")
+    params = thread_start["params"]
+    assert params["sandbox"] == "read-only"
+    assert params["approvalPolicy"] == "on-request"
+    await session.close()
+
+
+def test_sandboxed_true_for_real_container():
+    assert make_session(sandbox=FakeDockerSandbox())._sandboxed() is True
+
+
+def test_sandboxed_false_for_none():
+    assert make_session(sandbox=None)._sandboxed() is False
+
+
+def test_sandboxed_false_for_host_sentinel():
+    assert make_session(sandbox=FakeDockerSandbox(container_id="host"))._sandboxed() is False
+
+
+# --------------------------------------------------------------------------- #
+# locate_codex_native_bin_dir
+# --------------------------------------------------------------------------- #
+def test_locate_codex_native_bin_dir_npm_layout(tmp_path, monkeypatch):
+    from ctf_solver.providers.codex import locate_codex_native_bin_dir
+
+    pkg_root = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    wrapper = pkg_root / "bin" / "codex.js"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env node\n")
+    vendor_bin = pkg_root / "node_modules" / "@openai" / "codex-linux-x64" / "vendor" / "x86_64-unknown-linux-musl" / "bin"
+    vendor_bin.mkdir(parents=True)
+    (vendor_bin / "codex").write_bytes(b"\x7fELF-fake-native-binary")
+    (vendor_bin / "codex-code-mode-host").write_bytes(b"\x7fELF-fake-helper")
+
+    # `codex` on PATH is a symlink to the JS wrapper, like the real npm install.
+    exe_on_path = tmp_path / "bin" / "codex"
+    exe_on_path.parent.mkdir(parents=True)
+    exe_on_path.symlink_to(wrapper)
+
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: str(exe_on_path))
+    assert locate_codex_native_bin_dir() == str(vendor_bin)
+
+
+def test_locate_codex_native_bin_dir_standalone_elf(tmp_path, monkeypatch):
+    from ctf_solver.providers.codex import locate_codex_native_bin_dir
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "codex").write_bytes(b"\x7fELF-fake-native-binary")
+    (bindir / "codex-code-mode-host").write_bytes(b"\x7fELF-fake-helper")
+
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: str(bindir / "codex"))
+    assert locate_codex_native_bin_dir() == str(bindir)
+
+
+def test_locate_codex_native_bin_dir_missing_sibling_helper(tmp_path, monkeypatch):
+    """A native `codex` binary with no `codex-code-mode-host` next to it isn't
+    usable — code-mode execution would fail at runtime, so don't claim it."""
+    from ctf_solver.providers.codex import locate_codex_native_bin_dir
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "codex").write_bytes(b"\x7fELF-fake-native-binary")
+
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: str(bindir / "codex"))
+    assert locate_codex_native_bin_dir() is None
+
+
+def test_locate_codex_native_bin_dir_not_on_path(monkeypatch):
+    from ctf_solver.providers.codex import locate_codex_native_bin_dir
+
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: None)
+    assert locate_codex_native_bin_dir() is None
+
+
+def test_locate_codex_native_bin_dir_js_wrapper_with_no_vendor_package(tmp_path, monkeypatch):
+    """A JS wrapper that isn't an ELF and has no vendor/*/bin/codex anywhere
+    under it must not be mistaken for a usable native binary."""
+    from ctf_solver.providers.codex import locate_codex_native_bin_dir
+
+    wrapper = tmp_path / "bin" / "codex"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env node\n")
+
+    monkeypatch.setattr("ctf_solver.providers.codex.shutil.which", lambda _: str(wrapper))
+    assert locate_codex_native_bin_dir() is None
+
+
+# --------------------------------------------------------------------------- #
+# Real deadlock found via a live `codex app-server`: it emits exactly ONE
+# item/tool/call and then pauses, waiting for our RPC response — it does NOT
+# batch several before pausing. The old _drain_turn kept blocking on a SECOND
+# queue item after the first ToolCall, which never arrives until we answer
+# the first one: model waits on us, we wait on it. In practice this only
+# ever resolved via the swarm's outer per-call timeout, silently burning the
+# entire turn budget on every single tool call.
+# --------------------------------------------------------------------------- #
+async def test_single_tool_call_with_no_immediate_turn_completed_does_not_hang(fake_proc):
+    """The turn/completed line is deliberately withheld here (unlike
+    drive_turn, which always appends it) — exactly the real protocol
+    behavior: send() must return with that one tool call instead of
+    blocking forever waiting for a second one."""
+    session = make_session()
+    task = asyncio.create_task(session.send("go"))
+    await wait_for_method(fake_proc, "turn/start")
+    await feed_consumed(
+        fake_proc,
+        {
+            "method": "item/tool/call",
+            "id": 7,
+            "params": {"callId": "call-only", "tool": "bash", "arguments": {"command": "ls"}},
+        },
+    )
+    resp = await asyncio.wait_for(task, timeout=TIMEOUT)
+    assert [tc.call_id for tc in resp.tool_calls] == ["call-only"]
     assert resp.done is False
     await session.close()

@@ -121,8 +121,10 @@ class MockProvider(ProviderBase):
     def validate_config(self, config: dict) -> bool:
         return True
 
-    async def create_session(self, solver_id, system_prompt, tools, config) -> MockSession:
+    async def create_session(self, solver_id, system_prompt, tools, config, sandbox=None) -> MockSession:
         session = MockSession(self.scripts.get(solver_id, []))
+        session.system_prompt = system_prompt  # exposed for prompt-wiring assertions
+        session.sandbox = sandbox  # exposed for sandbox-wiring assertions
         self.sessions[solver_id] = session
         return session
 

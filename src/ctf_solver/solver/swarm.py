@@ -17,6 +17,7 @@ from ctf_solver.events import EventBus, SolverEvent
 from ctf_solver.prompts import ChallengeMeta, build_prompt, list_distfiles
 from ctf_solver.providers import get_provider
 from ctf_solver.providers.base import SolverSession, ToolCall, ToolDef, ToolResult
+from ctf_solver.providers.codex import locate_codex_native_bin_dir
 from ctf_solver.sandbox.docker import DockerSandbox
 from ctf_solver.sandbox.host import HostSandbox
 from ctf_solver.session_state import SessionState, SolverState
@@ -261,11 +262,20 @@ class ChallengeSwarm:
                 if self.settings.no_docker:
                     sandbox: DockerSandbox | HostSandbox = HostSandbox(challenge_dir=self.challenge_dir)
                 else:
+                    extra_ro_binds = []
+                    if provider_name == "codex":
+                        bin_dir = locate_codex_native_bin_dir()
+                        if bin_dir:
+                            extra_ro_binds = [f"{bin_dir}:/opt/codex-bin:ro"]
+                        # If not found, the Codex session's own docker-exec
+                        # attempt below fails loudly (missing binary) instead
+                        # of silently running codex unconfined on the host.
                     sandbox = DockerSandbox(
                         image=self.settings.sandbox_image,
                         challenge_dir=self.challenge_dir,
                         memory_limit=self.settings.sandbox_memory,
                         cpu_limit=self.settings.sandbox_cpus,
+                        extra_ro_binds=extra_ro_binds,
                     )
                 instance = SolverInstance(
                     solver_id=solver_id,
@@ -387,6 +397,9 @@ class ChallengeSwarm:
         await inst.sandbox.start()
         self.event_bus.publish(SolverEvent(type="state_change", solver_id=inst.solver_id, data={"state": "running"}))
 
+        if inst.provider_name == "codex" and not self.settings.openai_api_key:
+            self._prepare_codex_subscription_home(inst)
+
         log_dir = self.settings.log_dir or "logs"
         inst.tracer = SolverTracer(self.challenge_name, inst.provider_name, log_dir=log_dir)
 
@@ -399,8 +412,30 @@ class ChallengeSwarm:
         container_arch = "linux/amd64"
         system_prompt = build_prompt(meta, distfiles, container_arch, hint=self.settings.hint)
         tools = _build_tool_defs()
-        inst.session = await provider.create_session(inst.solver_id, system_prompt, tools, config)
+        inst.session = await provider.create_session(
+            inst.solver_id, system_prompt, tools, config, sandbox=inst.sandbox
+        )
         return None
+
+    @staticmethod
+    def _prepare_codex_subscription_home(inst: SolverInstance) -> None:
+        """Copy only auth.json (never the whole ~/.codex — that also holds
+        session history, local notes, etc.) into the sandbox's already
+        read-write workspace bind, so the containerized codex process (see
+        providers/codex.py) can authenticate with the user's ChatGPT/Codex
+        subscription without ever seeing the real ~/.codex directory."""
+        workspace_dir = getattr(inst.sandbox, "workspace_dir", "")
+        if not workspace_dir:
+            return
+        host_auth = Path.home() / ".codex" / "auth.json"
+        codex_home = Path(workspace_dir) / ".codex-home"
+        codex_home.mkdir(exist_ok=True)
+        if host_auth.exists():
+            import shutil as _shutil
+
+            dest = codex_home / "auth.json"
+            _shutil.copy2(host_auth, dest)
+            dest.chmod(0o600)
 
     async def _run_loop(self, inst: SolverInstance, t0: float) -> SolverResult:
         message = "Start solving."

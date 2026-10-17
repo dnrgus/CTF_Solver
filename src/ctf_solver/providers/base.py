@@ -70,7 +70,15 @@ class ProviderBase(ABC):
         system_prompt: str,
         tools: list[ToolDef],
         config: dict,
-    ) -> SolverSession: ...
+        sandbox: object | None = None,
+    ) -> SolverSession:
+        """`sandbox` is the solver's SandboxProtocol instance, when one is running.
+
+        Only the Codex provider uses it (to run its own native agent process
+        confined inside that same sandbox instead of on the bare host — see
+        providers/codex.py). Every other provider ignores it; it is only ever
+        a SandboxProtocol-shaped object, never a real tool for them to call."""
+        ...
 
     @abstractmethod
     def validate_config(self, config: dict) -> bool: ...
