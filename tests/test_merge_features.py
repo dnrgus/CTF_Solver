@@ -78,6 +78,52 @@ def test_placeholder_detection():
     assert not _is_placeholder_flag("FLAG{r34l_fl4g_9f2}")
 
 
+def test_placeholder_detection_catches_known_sandbox_decoys():
+    """Decoy flags found planted in challenge/sandbox files to catch naive
+    strings/grep solving — observed live during a POCTF_2026 benchmark run
+    where the solver declared victory in <60s without ever touching the
+    remote target."""
+    assert _is_placeholder_flag("POCTF{dev.flag.local.testing.only}")
+    assert _is_placeholder_flag("POCTF{local_test_flag_padding_oracle_cbc}")
+
+
+async def test_flag_rejected_without_remote_contact_when_target_has_connection_info(tmp_path, patch_backends):
+    """A challenge with a remote target must not confirm a flag the solver
+    merely found in local files — it must have actually connected to the
+    remote host/port first (bash command referencing it)."""
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{found_it_locally}")])]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+
+    await swarm.run()
+
+    assert swarm.confirmed_flag is None
+
+
+async def test_flag_accepted_after_remote_contact(tmp_path, patch_backends):
+    provider = MockProvider({"claude-0": [
+        _bash_turn("nc 10.0.0.5 1337"),
+        resp(tool_calls=[tool("submit_flag", flag="CTF{actually_exploited_it}")]),
+    ]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+
+    await swarm.run()
+
+    assert swarm.confirmed_flag == "CTF{actually_exploited_it}"
+
+
+async def test_flag_accepted_without_remote_contact_when_no_connection_info(tmp_path, patch_backends):
+    """Local-only challenges (no remote target) are unaffected by the gate."""
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{local_only_challenge}")])]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, claude_count=1)
+
+    await swarm.run()
+
+    assert swarm.confirmed_flag == "CTF{local_only_challenge}"
+
+
 async def test_strict_flags_never_confirms(tmp_path, patch_backends):
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="FLAG{real_one}")])]})
     patch_backends(provider)

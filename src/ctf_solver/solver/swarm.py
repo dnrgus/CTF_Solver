@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,14 +52,35 @@ BUMP_COOLDOWN_STEP = 30.0
 BUMP_COOLDOWN_MAX = 300.0
 INSIGHT_SHARE_INTERVAL = 5
 
-_PLACEHOLDER_MARKERS = ("placeholder", "example", "fake", "xxxx", "redacted")
+_PLACEHOLDER_MARKERS = (
+    "placeholder", "example", "fake", "xxxx", "redacted",
+    "dev.flag", "local_test", "local.test", "testing.only", "dummy_flag",
+    "sample_flag", "test_flag_do_not_submit",
+)
 _PLACEHOLDER_BODIES = {"flag", "...", "", "test", "here", "your_flag_here"}
 
 
 def _is_placeholder_flag(flag: str) -> bool:
-    """True for template flags like CTF{flag} or FLAG{placeholder}."""
+    """True for template flags like CTF{flag} or known decoy/bait strings
+    planted in challenge sandboxes to catch naive strings/grep solving."""
     body = flag[flag.find("{") + 1 : flag.rfind("}")].strip().lower() if "{" in flag else ""
     return body in _PLACEHOLDER_BODIES or any(m in body for m in _PLACEHOLDER_MARKERS)
+
+
+def _parse_connection_info(connection_info: str) -> tuple[str | None, str | None]:
+    """Best-effort host/port extraction from a free-form connection hint
+    like "nc 169.58.126.107 5007" or "169.58.126.107:5007"."""
+    if not connection_info:
+        return None, None
+    tokens = re.split(r"[\s:]+", connection_info.strip())
+    host: str | None = None
+    port: str | None = None
+    for tok in tokens:
+        if re.fullmatch(r"\d{1,5}", tok) and port is None:
+            port = tok
+        elif host is None and tok.lower() not in ("nc", "ncat", "telnet", "connect", "to", "at"):
+            host = tok
+    return host, port
 
 
 def _load_harness(path: str) -> str:
@@ -199,6 +221,7 @@ class SolverInstance:
     consecutive_errors: int = 0
     flag: str | None = None
     confirmed: bool = False
+    contacted_remote: bool = False
     findings: str = ""
     cost_usd: float = 0.0
     _wrong_submit_count: int = 0
@@ -264,6 +287,13 @@ class ChallengeSwarm:
             return "Empty flag — nothing to validate.", False
         if _is_placeholder_flag(flag):
             return f"Flag '{flag}' looks like a placeholder — not a real flag.", False
+        if self.connection_info and not inst.contacted_remote:
+            return (
+                f"Flag '{flag}' rejected — this challenge has a remote target "
+                f"({self.connection_info}) and no evidence this solver has connected to it "
+                "yet (no bash command referenced that host/port). Local files alone are not "
+                "sufficient; connect to and exploit the remote target first."
+            ), False
 
         # Dedup, cooldown and verification are decided atomically so two solvers
         # racing on the same flag cannot both pass the "not yet tried" check.
@@ -821,7 +851,12 @@ class ChallengeSwarm:
         args = tc.arguments
 
         if name == "bash":
-            return await do_bash(inst.sandbox, args.get("command", ""), int(args.get("timeout_seconds", args.get("timeout", 60))))
+            command = args.get("command", "")
+            if self.connection_info and not inst.contacted_remote:
+                host, port = _parse_connection_info(self.connection_info)
+                if host and host in command and (not port or port in command):
+                    inst.contacted_remote = True
+            return await do_bash(inst.sandbox, command, int(args.get("timeout_seconds", args.get("timeout", 60))))
         elif name == "read_file":
             return await do_read_file(inst.sandbox, args.get("path", ""))
         elif name == "write_file":
