@@ -136,6 +136,30 @@ async def retry_with_backoff(fn, max_retries: int = 3, base_delay: float = 1.0):
             await asyncio.sleep(delay)
 
 
+LONG_CALL_WARN_INTERVAL = 60  # seconds
+
+
+async def _warn_if_long_running(solver_id: str, started: float) -> None:
+    """Background watchdog for a single LLM call: a provider's own native
+    tool/code execution (e.g. Codex's code mode) can run for a long time
+    without this system ever seeing a tool_call — there's nothing to log
+    until the call returns or the outer per-challenge timeout cuts it off.
+    This at least surfaces that something is still running, so a long turn
+    shows up in the log instead of only being discoverable by inspecting the
+    sandbox container live."""
+    elapsed = 0
+    while True:
+        await asyncio.sleep(LONG_CALL_WARN_INTERVAL)
+        elapsed += LONG_CALL_WARN_INTERVAL
+        logger.warning(
+            "[%s] LLM call still running after %ds (started %.0fs ago) — likely waiting "
+            "on something outside this system's view (e.g. a network read with no "
+            "timeout in the model's own script, or a provider's own native tool use "
+            "this system can't observe).",
+            solver_id, elapsed, time.monotonic() - started,
+        )
+
+
 @dataclass
 class SolverInstance:
     solver_id: str
@@ -484,10 +508,11 @@ class ChallengeSwarm:
                         data={"summary": insights_text[:200]},
                     ))
 
+            remaining = self.settings.timeout - (time.monotonic() - t0)
+            if remaining <= 0:
+                break
+            watchdog = asyncio.create_task(_warn_if_long_running(inst.solver_id, time.monotonic()))
             try:
-                remaining = self.settings.timeout - (time.monotonic() - t0)
-                if remaining <= 0:
-                    break
                 _msg, _presults = message, pending_tool_results
                 response = await asyncio.wait_for(
                     retry_with_backoff(
@@ -500,7 +525,10 @@ class ChallengeSwarm:
             except Exception as e:
                 if cb:
                     cb.record_failure()
-                logger.warning("[%s] LLM call failed: %s", inst.solver_id, e)
+                # str(e) is empty for asyncio.TimeoutError — name the type too,
+                # or a timeout silently logs as "LLM call failed: " with nothing
+                # useful after the colon.
+                logger.warning("[%s] LLM call failed: %s: %s", inst.solver_id, type(e).__name__, e)
                 return SolverResult(
                     solver_id=inst.solver_id,
                     status=ResultStatus.ERROR,
@@ -512,6 +540,8 @@ class ChallengeSwarm:
                     findings_summary=inst.findings,
                     error=str(e),
                 )
+            finally:
+                watchdog.cancel()
 
             if cb:
                 cb.record_success()

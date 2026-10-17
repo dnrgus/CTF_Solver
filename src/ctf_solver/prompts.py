@@ -189,6 +189,11 @@ def build_prompt(
         "4. Recover the flag, then verify it with `submit_flag` (it checks the pattern locally).",
         "5. Ignore placeholder flags like `CTF{flag}` or `FLAG{placeholder}`.",
         "6. Once you have the real flag, output `FLAG: <value>` on its own line.",
+        "7. Always run commands through the `bash` tool, not any other execution mechanism —",
+        "   that is the only path whose output and timing this system can see and bound.",
+        "8. Any script that touches the network MUST set an explicit timeout on every blocking",
+        "   call (e.g. pwntools `context.timeout=10` or per-call `timeout=`, socket `settimeout()`).",
+        "   A remote that never responds must not hang your script forever.",
     ]
 
     return "\n".join(lines)
