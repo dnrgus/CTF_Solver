@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from conftest import MockProvider, resp, tool
 from test_swarm_behavioral import _bash_turn, _swarm
 
@@ -87,17 +89,51 @@ def test_placeholder_detection_catches_known_sandbox_decoys():
     assert _is_placeholder_flag("POCTF{local_test_flag_padding_oracle_cbc}")
 
 
-async def test_flag_rejected_without_remote_contact_when_target_has_connection_info(tmp_path, patch_backends):
-    """A challenge with a remote target must not confirm a flag the solver
-    merely found in local files — it must have actually connected to the
-    remote host/port first (bash command referencing it)."""
+async def test_flag_rejected_without_remote_contact_when_target_has_connection_info(tmp_path, patch_backends, monkeypatch):
+    """A challenge with a reachable remote target must not confirm a flag
+    found after only a handful of tool calls with no evidence the solver
+    ever connected to the remote host/port -- the classic decoy-grab
+    pattern observed live (flag found at step 0)."""
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{found_it_locally}")])]})
     patch_backends(provider)
     swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=True))
 
     await swarm.run()
 
     assert swarm.confirmed_flag is None
+
+
+async def test_flag_accepted_without_remote_contact_when_remote_unreachable(tmp_path, patch_backends, monkeypatch):
+    """A flag candidate must not be blocked forever just because the remote
+    target happens to be down -- the contact requirement only makes sense
+    when there is actually something reachable to contact."""
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{derived_locally_remote_is_down}")])]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=False))
+
+    await swarm.run()
+
+    assert swarm.confirmed_flag == "CTF{derived_locally_remote_is_down}"
+
+
+async def test_flag_accepted_without_remote_contact_after_substantial_local_analysis(tmp_path, patch_backends, monkeypatch):
+    """A flag found after real analysis (several tool calls), not an
+    instant decoy grab, is allowed through even without remote contact."""
+    provider = MockProvider({"claude-0": [
+        _bash_turn("file chall.bin"),
+        _bash_turn("strings chall.bin | head"),
+        _bash_turn("python3 decode.py"),
+        resp(tool_calls=[tool("submit_flag", flag="CTF{derived_after_real_analysis}")]),
+    ]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=True))
+
+    await swarm.run()
+
+    assert swarm.confirmed_flag == "CTF{derived_after_real_analysis}"
 
 
 async def test_flag_accepted_after_remote_contact(tmp_path, patch_backends):

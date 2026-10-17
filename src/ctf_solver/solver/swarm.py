@@ -51,6 +51,7 @@ SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]
 BUMP_COOLDOWN_STEP = 30.0
 BUMP_COOLDOWN_MAX = 300.0
 INSIGHT_SHARE_INTERVAL = 5
+MIN_STEPS_BEFORE_UNCONTACTED_FLAG = 3
 
 _PLACEHOLDER_MARKERS = (
     "placeholder", "example", "fake", "xxxx", "redacted",
@@ -252,6 +253,28 @@ class ChallengeSwarm:
     session_state: SessionState | None = None
     resume_state: SessionState | None = None
     _results: dict[str, ResultStatus] = field(default_factory=dict)
+    _remote_reachable: bool | None = field(default=None, repr=False)
+
+    async def _remote_is_reachable(self) -> bool:
+        """Probed once per run and cached. A remote target that is down (or
+        has no parseable host/port) must not block an otherwise-plausible
+        flag forever -- the contact requirement only makes sense when there
+        is actually something to contact."""
+        if self._remote_reachable is not None:
+            return self._remote_reachable
+        host, port = _parse_connection_info(self.connection_info)
+        if not host or not port:
+            self._remote_reachable = False
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port)), timeout=5.0
+            )
+            writer.close()
+            self._remote_reachable = True
+        except Exception:
+            self._remote_reachable = False
+        return self._remote_reachable
 
     def _check_cooldown(self, inst: SolverInstance) -> tuple[bool, str]:
         """Check if solver is in cooldown. Returns (is_cooled_down, message)."""
@@ -287,12 +310,19 @@ class ChallengeSwarm:
             return "Empty flag — nothing to validate.", False
         if _is_placeholder_flag(flag):
             return f"Flag '{flag}' looks like a placeholder — not a real flag.", False
-        if self.connection_info and not inst.contacted_remote:
+        if (
+            self.connection_info
+            and not inst.contacted_remote
+            and inst.step_count < MIN_STEPS_BEFORE_UNCONTACTED_FLAG
+            and await self._remote_is_reachable()
+        ):
             return (
-                f"Flag '{flag}' rejected — this challenge has a remote target "
-                f"({self.connection_info}) and no evidence this solver has connected to it "
-                "yet (no bash command referenced that host/port). Local files alone are not "
-                "sufficient; connect to and exploit the remote target first."
+                f"Flag '{flag}' rejected — found after only {inst.step_count} tool call(s), "
+                f"this challenge has a reachable remote target ({self.connection_info}), and "
+                "there is no evidence this solver has connected to it yet (no bash command "
+                "referenced that host/port). This looks like a decoy/placeholder planted in "
+                "local files rather than the real flag; connect to and exploit the remote "
+                "target, or do substantially more local analysis before resubmitting."
             ), False
 
         # Dedup, cooldown and verification are decided atomically so two solvers
