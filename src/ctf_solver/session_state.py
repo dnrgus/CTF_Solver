@@ -27,6 +27,9 @@ class SessionState:
     solvers: list[SolverState] = field(default_factory=list)
     total_cost_usd: float = 0.0
     confirmed_flag: str | None = None
+    # FlagStatus value of confirmed_flag. None means a state file written before
+    # verification existed: its flag was only a regex match and is not trusted.
+    confirmed_status: str | None = None
     winner_id: str | None = None
 
     def save(self, log_dir: str) -> None:
@@ -41,6 +44,7 @@ class SessionState:
             "started_at": self.started_at,
             "total_cost_usd": self.total_cost_usd,
             "confirmed_flag": self.confirmed_flag,
+            "confirmed_status": self.confirmed_status,
             "winner_id": self.winner_id,
             "solvers": [asdict(s) for s in self.solvers],
         }

@@ -142,23 +142,24 @@ async def do_submit_flag(
     flag: str,
     flag_pattern: str,
     submitted_flags: set[str],
-    *,
-    accept_regex_as_verified: bool = False,
 ) -> tuple[str, bool]:
-    from ctf_solver.tools.flag import extract_flags
+    """Format-check one candidate. Returns ``(message, accepted_as_candidate)``.
+
+    This never verifies anything: a format match only makes the string a
+    CANDIDATE. Verification (verifier command / reproduction) is decided by the
+    swarm, which owns the flag records.
+    """
+    from ctf_solver.tools.flag import is_exact_flag
 
     flag = flag.strip()
     if not flag:
         return "Empty flag — nothing to validate.", False
     if flag in submitted_flags:
         return "Already tried this flag.", False
-    matches = extract_flags(flag, flag_pattern)
-    if not matches:
+    if not is_exact_flag(flag, flag_pattern):
         return f"Flag '{flag}' does not match expected pattern.", False
     submitted_flags.add(flag)
-    if accept_regex_as_verified:
-        return f"Flag accepted (regex-only mode): {flag}", True
-    return f"Flag candidate matches pattern but is not externally verified: {flag}", False
+    return f"Flag candidate recorded (format ok, not yet verified): {flag}", True
 
 
 async def do_notify_coordinator(message: str, event_bus: EventBus | None = None, solver_id: str = "") -> str:

@@ -43,6 +43,10 @@ class DockerSandbox:
     # process (e.g. codex app-server) to this container instead of the host —
     # see providers/codex.py and solver/swarm.py's _locate_codex_native_bin_dir.
     extra_ro_binds: list[str] = field(default_factory=list)
+    # Never silently grant external networking or a route back to the host.
+    # "bridge" permits arbitrary egress and is intentionally opt-in.
+    network_mode: str = "none"
+    allow_host_gateway: bool = False
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -72,6 +76,15 @@ class DockerSandbox:
             return DEFAULT_MEMORY
 
     async def start(self) -> None:
+        if self.network_mode not in {"none", "bridge"}:
+            raise ValueError("network_mode must be 'none' or 'bridge'")
+        if self.allow_host_gateway and self.network_mode != "bridge":
+            raise ValueError("host gateway requires explicit bridge networking")
+        if self.network_mode == "bridge":
+            logger.warning(
+                "Sandbox uses unrestricted Docker bridge egress. "
+                "This is NOT an outbound-domain allowlist."
+            )
         sem = get_container_semaphore()
         await sem.acquire()
         self._sem_acquired = True
@@ -90,11 +103,14 @@ class DockerSandbox:
                 "WorkingDir": "/challenge",
                 "Tty": False,
                 "Labels": {CONTAINER_LABEL: "true"},
+                "NetworkDisabled": self.network_mode == "none",
                 "HostConfig": {
                     "Binds": binds,
-                    "ExtraHosts": ["host.docker.internal:host-gateway"],
+                    "NetworkMode": self.network_mode,
+                    "ExtraHosts": (["host.docker.internal:host-gateway"]
+                                   if self.allow_host_gateway else []),
                     "CapDrop": ["ALL"],
-                    "CapAdd": ["SYS_PTRACE", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "CHOWN", "MKNOD"],
+                    "CapAdd": ["SYS_PTRACE", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "CHOWN"],
                     "SecurityOpt": ["no-new-privileges:true"],
                     "Memory": self._parse_memory_limit(),
                     "NanoCpus": self.cpu_limit * 1_000_000_000,

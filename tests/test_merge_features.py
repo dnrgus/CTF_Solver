@@ -12,6 +12,7 @@ from ctf_solver.prompts import ChallengeMeta, build_prompt
 from ctf_solver.providers.base import TokenUsage
 from ctf_solver.solver.solver_base import ResultStatus
 from ctf_solver.solver.swarm import _is_placeholder_flag, _parse_connection_info
+from ctf_solver.verification import FlagStatus
 
 
 def _fast_bump(monkeypatch):
@@ -27,7 +28,7 @@ async def test_bump_resumes_stopped_solver_and_solves(tmp_path, patch_backends, 
         resp(tool_calls=[tool("submit_flag", flag="FLAG{second_wind}")]),
     ]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1, max_bumps=2)
+    swarm = _swarm(tmp_path, claude_count=1, max_bumps=2, verifier_cmd="true")
 
     result = await swarm.run()
 
@@ -129,7 +130,7 @@ async def test_flag_rejected_without_remote_contact_when_target_has_connection_i
     pattern observed live (flag found at step 0)."""
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{found_it_locally}")])]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1, verifier_cmd="true")
     monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=True))
 
     await swarm.run()
@@ -143,7 +144,7 @@ async def test_flag_accepted_without_remote_contact_when_remote_unreachable(tmp_
     when there is actually something reachable to contact."""
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{derived_locally_remote_is_down}")])]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1, verifier_cmd="true")
     monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=False))
 
     await swarm.run()
@@ -161,7 +162,7 @@ async def test_flag_accepted_without_remote_contact_after_substantial_local_anal
         resp(tool_calls=[tool("submit_flag", flag="CTF{derived_after_real_analysis}")]),
     ]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1, verifier_cmd="true")
     monkeypatch.setattr(swarm, "_remote_is_reachable", AsyncMock(return_value=True))
 
     await swarm.run()
@@ -175,7 +176,7 @@ async def test_flag_accepted_after_remote_contact(tmp_path, patch_backends):
         resp(tool_calls=[tool("submit_flag", flag="CTF{actually_exploited_it}")]),
     ]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1)
+    swarm = _swarm(tmp_path, connection_info="nc 10.0.0.5 1337", claude_count=1, verifier_cmd="true")
 
     await swarm.run()
 
@@ -186,21 +187,23 @@ async def test_flag_accepted_without_remote_contact_when_no_connection_info(tmp_
     """Local-only challenges (no remote target) are unaffected by the gate."""
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="CTF{no_remote_target_here}")])]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1)
+    swarm = _swarm(tmp_path, claude_count=1, verifier_cmd="true")
 
     await swarm.run()
 
     assert swarm.confirmed_flag == "CTF{no_remote_target_here}"
 
 
-async def test_strict_flags_never_confirms(tmp_path, patch_backends):
+async def test_regex_match_without_verifier_never_confirms(tmp_path, patch_backends):
+    """No verifier and no solve.py: a format-valid submission stays a CANDIDATE."""
     provider = MockProvider({"claude-0": [resp(tool_calls=[tool("submit_flag", flag="FLAG{real_one}")])]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1, accept_regex_flag_as_verified=False)
+    swarm = _swarm(tmp_path, claude_count=1)
 
     await swarm.run()
 
     assert swarm.confirmed_flag is None
+    assert swarm.flag_records["FLAG{real_one}"].status == FlagStatus.CANDIDATE
 
 
 def test_prompt_nc_heredoc_and_first_action():

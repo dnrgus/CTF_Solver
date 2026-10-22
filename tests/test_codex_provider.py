@@ -170,8 +170,16 @@ class FakeDockerSandbox:
         self.container_id = container_id
 
 
-def make_session(sandbox=None, **config) -> CodexSession:
-    cfg = {"openai_api_key": "sk-test", **config}
+_DEFAULT_SANDBOX = object()
+
+
+def make_session(sandbox=_DEFAULT_SANDBOX, **config) -> CodexSession:
+    """A session inside a (fake) Docker container unless the test asks for no sandbox.
+
+    Codex refuses to start without a container, so protocol tests get one by default."""
+    if sandbox is _DEFAULT_SANDBOX:
+        sandbox = FakeDockerSandbox()
+    cfg = {"openai_api_key": "sk-test", "allow_container_credentials": True, **config}
     return CodexSession("solver-1", "system prompt", [], cfg, sandbox=sandbox)
 
 
@@ -619,24 +627,22 @@ async def test_drain_turn_strands_toolcall_when_completed_before_drain_starts(fa
 # providers/codex.py's _start_process docstring/comments for the live repro
 # that found this (it read files outside the intended sandbox).
 # --------------------------------------------------------------------------- #
-async def test_no_sandbox_spawns_bare_codex_on_host(fake_proc):
-    session = make_session()  # sandbox=None
-    resp = await drive_turn(session, fake_proc, "go", [])
-    assert resp.done is True
-
-    args, kwargs = fake_proc.spawn_calls[0]
-    assert args == ("codex", "app-server")
-    assert "OPENAI_API_KEY" in kwargs["env"]
+async def test_no_sandbox_refuses_to_run_codex_on_host(fake_proc):
+    """Without a Docker sandbox, codex must not start: its native tools would read the host."""
+    session = make_session(sandbox=None)
+    with pytest.raises(RuntimeError, match="require the Docker sandbox"):
+        await session._start_process()
+    assert fake_proc.spawn_calls == []
     await session.close()
 
 
-async def test_host_sandbox_sentinel_is_not_treated_as_containerized(fake_proc):
-    """HostSandbox's container_id is the literal string "host" (--no-docker),
-    not a real container — must NOT route through docker exec."""
+async def test_host_sandbox_sentinel_is_refused_not_run_on_host(fake_proc):
+    """HostSandbox's container_id is the literal string "host" (--no-docker): not a
+    container, so codex must not start there either."""
     session = make_session(sandbox=FakeDockerSandbox(container_id="host"))
-    await drive_turn(session, fake_proc, "go", [])
-    args, _ = fake_proc.spawn_calls[0]
-    assert args == ("codex", "app-server")
+    with pytest.raises(RuntimeError, match="require the Docker sandbox"):
+        await session._start_process()
+    assert fake_proc.spawn_calls == []
     await session.close()
 
 
@@ -656,6 +662,15 @@ async def test_docker_sandbox_spawns_codex_via_docker_exec(fake_proc):
     await session.close()
 
 
+async def test_container_credentials_denied_by_default(fake_proc):
+    """An auth-bearing container is refused unless the unsafe opt-in is set."""
+    session = make_session(sandbox=FakeDockerSandbox(), allow_container_credentials=False)
+    with pytest.raises(RuntimeError, match="credentials.*disabled"):
+        await session._start_process()
+    assert fake_proc.spawn_calls == []
+    await session.close()
+
+
 async def test_docker_sandbox_thread_start_uses_container_jail_params(fake_proc):
     sandbox = FakeDockerSandbox()
     session = make_session(sandbox=sandbox)
@@ -669,14 +684,11 @@ async def test_docker_sandbox_thread_start_uses_container_jail_params(fake_proc)
     await session.close()
 
 
-async def test_host_run_thread_start_keeps_old_read_only_params(fake_proc):
-    session = make_session()  # no sandbox
-    await drive_turn(session, fake_proc, "go", [])
-
-    thread_start = next(m for m in fake_proc.stdin.written_messages() if m.get("method") == "thread/start")
-    params = thread_start["params"]
-    assert params["sandbox"] == "read-only"
-    assert params["approvalPolicy"] == "on-request"
+async def test_host_run_never_sends_thread_start(fake_proc):
+    session = make_session(sandbox=None)
+    with pytest.raises(RuntimeError):
+        await session.send("go")
+    assert not any(m.get("method") == "thread/start" for m in fake_proc.stdin.written_messages())
     await session.close()
 
 

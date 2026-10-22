@@ -123,25 +123,26 @@ async def test_do_web_fetch_blocks_private_ip():
 
 
 @pytest.mark.asyncio
-async def test_do_submit_flag_valid():
+async def test_do_submit_flag_format_match_is_only_a_candidate():
+    """A format match is accepted as a candidate; it never reports verification."""
     flags: set[str] = set()
     msg, valid = await do_submit_flag(
         "FLAG{test}", r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}", flags
     )
-    assert valid is False
+    assert valid is True
     assert "FLAG{test}" in flags
-    assert "not externally verified" in msg
+    assert "not yet verified" in msg
 
 
 @pytest.mark.asyncio
-async def test_do_submit_flag_valid_regex_mode():
+async def test_do_submit_flag_rejects_embedded_flag_in_surrounding_text():
+    """'junk FLAG{x} junk' contains a flag but is not one; it must not become a candidate."""
     flags: set[str] = set()
     msg, valid = await do_submit_flag(
-        "FLAG{test}", r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}", flags,
-        accept_regex_as_verified=True,
+        "result: FLAG{x} done", r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}", flags
     )
-    assert valid is True
-    assert "FLAG{test}" in flags
+    assert valid is False
+    assert flags == set()
 
 
 @pytest.mark.asyncio

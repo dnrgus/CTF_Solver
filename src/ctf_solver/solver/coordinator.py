@@ -55,8 +55,16 @@ class CoordinatorAgent:
         # having the exact same issue. So the coordinator needs its own
         # confining sandbox exactly like a solver instance does, not just an
         # empty tool list, whenever Docker is available to provide one.
-        if self.provider_name == "codex" and not self.settings.no_docker:
+        if self.provider_name == "codex":
+            if self.settings.no_docker:
+                logger.error("Refusing unconfined Codex coordinator on host")
+                return
+            if not self.settings.allow_container_credentials:
+                logger.warning("Codex coordinator disabled: credentials are not sandbox-safe")
+                return
             await self._start_codex_sandbox()
+            if self._sandbox is None:
+                return
         self.session = await provider.create_session(
             solver_id="coordinator",
             system_prompt="You are a CTF coordinator. Read solver traces and provide strategic guidance.",
@@ -82,6 +90,8 @@ class CoordinatorAgent:
             memory_limit=self.settings.sandbox_memory,
             cpu_limit=self.settings.sandbox_cpus,
             extra_ro_binds=extra_ro_binds,
+            network_mode=self.settings.sandbox_network_mode,
+            allow_host_gateway=self.settings.sandbox_allow_host_gateway,
         )
         try:
             await sandbox.start()

@@ -15,6 +15,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 
+from ctf_solver.artifacts import write_run_artifacts
 from ctf_solver.config import (
     Settings,
     get_coordinator_provider,
@@ -109,7 +110,10 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--interactive", is_flag=True, help="Enable stdin hint input")
 @click.option("--harness-file", default=None, type=click.Path(exists=True, dir_okay=False), help="Extra harness text appended to every solver's system prompt (for A/B runs)")
 @click.option("--max-bumps", default=None, type=int, help="Re-engage a stopped solver up to N times with sibling insights (0 = off)")
-@click.option("--strict-flags", is_flag=True, help="Do not auto-confirm regex-matching flags (candidates are only recorded)")
+@click.option("--max-agents", default=None, type=click.IntRange(1, 3), help="Most solver agents started for this challenge (1-3, default 1). Agent 2+ start only on a stall or a refuted hypothesis.")
+@click.option("--verifier-cmd", default=None, help="Authoritative check run for each submitted flag: exit 0 accepts, 1 rejects, anything else is unknown. The flag is in $CTF_FLAG. Runs on the host, not in the sandbox.")
+@click.option("--kb-dir", default=None, type=click.Path(file_okay=False), help="ctf-knowledge-base checkout; enables the kb_search tool for solvers")
+@click.option("--strict-flags", is_flag=True, hidden=True, help="Deprecated no-op: regex matches are never auto-confirmed")
 @click.option("--sandbox-image", default=None, help="Docker image")
 @click.option("--sandbox-memory", default=None, help="Memory limit per container")
 @click.option("--sandbox-cpus", default=None, type=int, help="CPU limit per container")
@@ -141,6 +145,9 @@ def main(
     interactive: bool,
     harness_file: str | None,
     max_bumps: int | None,
+    max_agents: int | None,
+    verifier_cmd: str | None,
+    kb_dir: str | None,
     strict_flags: bool,
     sandbox_image: str | None,
     sandbox_memory: str | None,
@@ -159,6 +166,8 @@ def main(
     _setup_logging(verbose)
 
     defaults = Settings()
+    if strict_flags:
+        console.print("[dim]--strict-flags is now the default: regex matches are never auto-confirmed.[/dim]")
 
     if config:
         toml_data = load_toml_config(config)
@@ -207,9 +216,17 @@ def main(
         console.print(f"  Started: {prev.started_at}")
         for s in prev.solvers:
             console.print(f"  {s.solver_id}: {s.status}, {s.steps} steps, ${s.cost_usd:.4f}, flag={s.flag}")
-        if prev.confirmed_flag:
-            console.print(f"\n[bold green]FLAG ALREADY FOUND: {prev.confirmed_flag} (by {prev.winner_id})[/bold green]")
+        if prev.confirmed_flag and prev.confirmed_status:
+            console.print(
+                f"\n[bold green]VERIFIED FLAG ALREADY FOUND: {prev.confirmed_flag} "
+                f"({prev.confirmed_status}, by {prev.winner_id})[/bold green]"
+            )
             return
+        if prev.confirmed_flag:
+            console.print(
+                "[yellow]The previous state's flag has no verification record (it predates "
+                "verification) and is treated as unverified.[/yellow]"
+            )
         console.print("\n[yellow]No flag found previously. Resuming the same challenge...[/yellow]")
         # Make --resume self-sufficient: reuse the prior challenge unless overridden.
         if not challenge_dir and not files:
@@ -256,6 +273,15 @@ def main(
         console.print("[red]Error: --desc is required when using --files[/red]")
         sys.exit(1)
 
+    if not flag_pattern and challenge_dir:
+        flag_pattern = _challenge_flag_pattern(challenge_dir)
+    if flag_pattern:
+        try:
+            re.compile(flag_pattern)
+        except re.error as e:
+            console.print(f"[red]Error: invalid flag pattern {flag_pattern!r}: {e}[/red]")
+            sys.exit(1)
+
     if not challenge_dir and not files and not bare_mode:
         console.print("[red]Error: specify --challenge-dir or --files[/red]")
         sys.exit(1)
@@ -270,11 +296,13 @@ def main(
         max_steps=_max_steps,
         max_cost=_max_cost,
         flag_pattern=flag_pattern or Settings.model_fields["flag_pattern"].default,
+        verifier_cmd=verifier_cmd or "",
+        kb_dir=kb_dir or "",
+        max_agents=max_agents if max_agents is not None else defaults.max_agents,
         hint=hint or "",
         interactive=interactive,
         harness_file=harness_file or "",
         max_bumps=max_bumps if max_bumps is not None else defaults.max_bumps,
-        accept_regex_flag_as_verified=not strict_flags,
         sandbox_image=sandbox_image or defaults.sandbox_image,
         sandbox_memory=sandbox_memory or defaults.sandbox_memory,
         sandbox_cpus=sandbox_cpus if sandbox_cpus is not None else defaults.sandbox_cpus,
@@ -369,14 +397,7 @@ def main(
         result = asyncio.run(_run_cli(swarm, event_bus, settings, interactive, port, sigint_triggered, coordinator_provider=coord))
         from ctf_solver.writeup import generate_writeup
 
-        if result and result.flag:
-            console.print(f"\n[bold green]FLAG FOUND: {result.flag}[/bold green]")
-            console.print(f"  Solver: {result.solver_id}")
-            console.print(f"  Steps: {result.steps}, Duration: {result.duration:.1f}s, Cost: ${result.cost_usd:.4f}")
-        elif sigint_triggered[0]:
-            console.print("\n[yellow]Interrupted — generating partial writeup.[/yellow]")
-        else:
-            console.print("\n[red]No flag found.[/red]")
+        _report_outcome(swarm, sigint_triggered[0], Path(chall_dir).name, category or "")
         if result:
             generate_writeup(
                 output_dir or chall_dir, Path(chall_dir).name, category, result,
@@ -441,8 +462,43 @@ def main(
             return result
 
         result = asyncio.run(run_with_tui())
-        if result and result.flag:
-            console.print(f"\n[bold green]FLAG: {result.flag}[/bold green]")
+        _report_outcome(swarm, sigint_triggered[0], Path(chall_dir).name, category or "")
+
+
+def _challenge_flag_pattern(challenge_dir: str) -> str | None:
+    """The per-challenge flag format from challenge.yml (key ``flag_pattern``), if any."""
+    import yaml
+
+    for name in ("challenge.yml", "challenge.yaml"):
+        path = Path(challenge_dir) / name
+        if path.is_file():
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            pattern = data.get("flag_pattern") if isinstance(data, dict) else None
+            return str(pattern) if pattern else None
+    return None
+
+
+def _report_outcome(swarm: ChallengeSwarm, interrupted: bool, challenge_name: str, category: str) -> None:
+    """Print the verified outcome (never a bare regex match) and write the run artifacts."""
+    if swarm.confirmed_flag and swarm.confirmed_status is not None:
+        console.print(
+            f"\n[bold green]VERIFIED FLAG: {swarm.confirmed_flag}[/bold green] "
+            f"({swarm.confirmed_status.value}, solver {swarm.winner_id})"
+        )
+    elif interrupted:
+        console.print("\n[yellow]Interrupted — no verified flag.[/yellow]")
+    else:
+        console.print("\n[red]No verified flag.[/red]")
+    unverified = [r for r in swarm.flag_records.values() if not r.verified]
+    if unverified:
+        console.print("[yellow]Unverified candidates (not counted as a solve):[/yellow]")
+        for record in unverified:
+            console.print(f"  {record.flag}  [{record.status.value}]  {record.solver_id}")
+    try:
+        written = write_run_artifacts(swarm, challenge_name, category)
+        console.print(f"  Artifacts: {swarm.artifact_dir} ({', '.join(written)})")
+    except OSError as e:
+        console.print(f"[red]Could not write run artifacts: {e}[/red]")
 
 
 async def _run_cli(

@@ -5,6 +5,7 @@ import pytest
 
 def test_default_settings():
     from ctf_solver.config import Settings
+    from ctf_solver.tools.flag import DEFAULT_FLAG_PATTERN
 
     s = Settings()
     assert s.sandbox_image == "ctf-sandbox"
@@ -13,7 +14,9 @@ def test_default_settings():
     assert s.timeout == 86400  # effectively unbounded — max_cost/max_steps/max_bumps are the real limits
     assert s.max_steps == 100
     assert s.max_cost == 10.0
-    assert s.flag_pattern == r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"
+    assert s.flag_pattern == DEFAULT_FLAG_PATTERN
+    assert s.verifier_cmd == ""
+    assert s.max_agents == 1
 
 
 def test_settings_from_env(monkeypatch):

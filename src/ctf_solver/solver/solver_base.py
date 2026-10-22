@@ -10,7 +10,8 @@ from ctf_solver.providers.base import TokenUsage
 
 
 class ResultStatus(Enum):
-    SOLVED = "solved"
+    SOLVED = "solved"  # flag REMOTE_CONFIRMED by the operator-configured verifier
+    REPRODUCED = "reproduced"  # flag LOCALLY_REPRODUCED by solve.py in a fresh sandbox
     FAILED = "failed"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"

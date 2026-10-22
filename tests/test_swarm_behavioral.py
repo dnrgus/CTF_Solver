@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from conftest import FakeSandbox, MockProvider, resp, tool
+from conftest import FakeSandbox, MockProvider, MockSession, resp, tool
 
 import ctf_solver.solver.swarm as swarm_mod
 from ctf_solver.config import Settings
@@ -16,6 +16,7 @@ from ctf_solver.solver.swarm import (
     ChallengeSwarm,
     SolverInstance,
 )
+from ctf_solver.verification import FlagStatus
 
 
 def _settings(tmp_path, **kw) -> Settings:
@@ -27,7 +28,8 @@ def _settings(tmp_path, **kw) -> Settings:
         "timeout": 30,
         "max_steps": 50,
         "max_cost": 100.0,
-        "accept_regex_flag_as_verified": True,
+        # Codex subscription runs need the unsafe legacy opt-in; these tests cover the swarm, not credentials.
+        "allow_container_credentials": True,
     }
     base.update(kw)
     return Settings(**base)
@@ -63,11 +65,12 @@ def _drain(bus: EventBus, queue: asyncio.Queue[SolverEvent]) -> list[SolverEvent
 
 
 async def test_swarm_solves_via_submit_flag(tmp_path, patch_backends):
+    """A deliberate submission the operator's verifier accepts is a solve."""
     provider = MockProvider(
         {"claude-0": [resp(tool_calls=[tool("submit_flag", flag="FLAG{win}")])]}
     )
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1)
+    swarm = _swarm(tmp_path, claude_count=1, verifier_cmd="true")
 
     result = await swarm.run()
 
@@ -77,32 +80,68 @@ async def test_swarm_solves_via_submit_flag(tmp_path, patch_backends):
     assert swarm.winner_id == "claude-0"
 
 
-async def test_regex_text_flag_is_accepted_as_solved(tmp_path, patch_backends):
-    """A bare flag in assistant text solves when regex flags are trusted."""
+async def test_regex_text_flag_is_only_a_candidate(tmp_path, patch_backends):
+    """A bare flag in assistant text matches the format but ends nothing: no verifier, no solve.py."""
     provider = MockProvider({"claude-0": [resp(text="I found it: FLAG{from_text}")]})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1, accept_regex_flag_as_verified=True)
+    swarm = _swarm(tmp_path, claude_count=1)
 
     result = await swarm.run()
 
-    assert result is not None
-    assert result.status == ResultStatus.SOLVED
-    assert result.flag == "FLAG{from_text}"
-    assert swarm.confirmed_flag == "FLAG{from_text}"
-    assert swarm.winner_id == "claude-0"
+    assert result is None
+    assert swarm.confirmed_flag is None
+    assert swarm.flag_records["FLAG{from_text}"].status == FlagStatus.CANDIDATE
 
 
-async def test_first_flag_wins_and_loser_is_cancelled(tmp_path, patch_backends):
-    """Winner locks the flag on turn 1; a long-running loser cannot override it."""
-    provider = MockProvider(
-        {
-            "claude-0": [resp(tool_calls=[tool("submit_flag", flag="FLAG{winner}")])],
-            # Loser keeps issuing distinct bash calls; it never produces a flag.
-            "codex-0": [_bash_turn(f"work-{i}") for i in range(40)],
-        }
-    )
+class _GatedSession(MockSession):
+    """Holds the first agent in place until a second agent has actually started.
+
+    Lets a test make two agents run concurrently without relying on timing:
+    the winner cannot submit until the loser is running.
+    """
+
+    def __init__(self, script, gate: asyncio.Event, opens: asyncio.Event | None = None) -> None:
+        super().__init__(script)
+        self._gate = gate
+        self._opens = opens
+
+    async def send(self, message: str, tool_results=None):
+        if self._opens is not None:
+            self._opens.set()
+        # Hold the final (submit) turn: it is the only one left in the script.
+        if self._gate is not None and not self._gate.is_set() and len(self._script) == 1:
+            await self._gate.wait()
+        return await super().send(message, tool_results)
+
+
+async def test_first_flag_wins_and_loser_is_cancelled(tmp_path, patch_backends, monkeypatch):
+    """A verified flag cancels the agent still running. The loser never produces a flag.
+
+    Agent 1 stalls (identical outputs) until Agent 2 is spawned, then submits. Agent 2
+    is cancelled once the winner's flag is verified.
+    """
+    monkeypatch.setattr(swarm_mod, "SCHEDULER_TICK_S", 0.001)
+    loser_started = asyncio.Event()
+
+    class _Provider(MockProvider):
+        async def create_session(self, solver_id, system_prompt, tools, config, sandbox=None):
+            if solver_id == "claude-0":
+                # Distinct commands with identical (empty) output: no novel evidence, so stalled.
+                script = [_bash_turn(f"noop-{i}") for i in range(10)] + [
+                    resp(tool_calls=[tool("submit_flag", flag="FLAG{winner}")]),
+                ]
+                session = _GatedSession(script, gate=loser_started)
+            else:
+                script = [_bash_turn(f"work-{i}") for i in range(200)]
+                session = _GatedSession(script, gate=None, opens=loser_started)
+            session.system_prompt = system_prompt
+            session.sandbox = sandbox
+            self.sessions[solver_id] = session
+            return session
+
+    provider = _Provider()
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1, codex_count=1)
+    swarm = _swarm(tmp_path, claude_count=1, codex_count=1, max_agents=2, verifier_cmd="true")
 
     result = await swarm.run()
 
@@ -126,25 +165,26 @@ async def test_duplicate_flag_is_deduped(tmp_path, patch_backends):
         }
     )
     patch_backends(provider)
-    # Keep accept_regex off so the first submit doesn't end the run as SOLVED.
-    swarm = _swarm(tmp_path, claude_count=1, accept_regex_flag_as_verified=False)
+    swarm = _swarm(tmp_path, claude_count=1)
 
     await swarm.run()
 
     assert swarm._submitted_flags == {"FLAG{dup}"}
 
-    # And the dedup branch returns the "Already tried" message directly.
+    # Resubmitting an unverified candidate with an unchanged solve.py is refused:
+    # the reproduction would only repeat the last result.
     inst = swarm.solvers["claude-0"]
     msg, is_valid = await swarm._handle_flag_candidate(inst, "FLAG{dup}")
     assert is_valid is False
-    assert "Already tried" in msg
+    assert "has not changed since the last check" in msg
 
 
 async def test_cooldown_blocks_second_distinct_submission(tmp_path, patch_backends):
     """Two distinct wrong flags in quick succession: the 2nd hits the escalating cooldown."""
     provider = MockProvider({"claude-0": []})
     patch_backends(provider)
-    swarm = _swarm(tmp_path, claude_count=1, accept_regex_flag_as_verified=False)
+    # A verifier that rejects (exit 1) makes each deliberate submission a wrong try.
+    swarm = _swarm(tmp_path, claude_count=1, verifier_cmd="false")
     inst = SolverInstance(
         solver_id="claude-0",
         provider_name="claude",
@@ -152,7 +192,7 @@ async def test_cooldown_blocks_second_distinct_submission(tmp_path, patch_backen
         sandbox=FakeSandbox(),
     )
 
-    # First distinct pattern-matching flag: not verified -> counts as a wrong submit.
+    # First distinct pattern-matching flag: the verifier rejects it -> counts as a wrong submit.
     msg1, valid1 = await swarm._handle_flag_candidate(inst, "FLAG{first}")
     assert valid1 is False
     assert inst._wrong_submit_count == 1
@@ -310,6 +350,7 @@ async def test_resume_skips_already_solved_solver(tmp_path, patch_backends):
         description="solve me",
         category="misc",
         confirmed_flag="FLAG{old}",
+        confirmed_status="remote_confirmed",
         winner_id="claude-0",
         solvers=[
             SolverState(
@@ -329,9 +370,32 @@ async def test_resume_skips_already_solved_solver(tmp_path, patch_backends):
     # Prior flag/winner carried forward; the would-be new flag never ran.
     assert swarm.solvers["claude-0"].flag == "FLAG{old}"
     assert swarm.confirmed_flag == "FLAG{old}"
+    assert swarm.confirmed_status == FlagStatus.REMOTE_CONFIRMED
     assert swarm.winner_id == "claude-0"
     # Only solver was skipped -> no tasks scheduled -> run() returns None.
     assert result is None
+
+
+async def test_legacy_resume_state_flag_is_not_trusted(tmp_path, patch_backends):
+    """A state file from before verification has a regex-only flag: it must not end the run."""
+    provider = MockProvider({"claude-0": [resp(tool_calls=[tool("bash", command="ls")])]})
+    patch_backends(provider)
+    swarm = _swarm(tmp_path, claude_count=1)
+    swarm.resume_state = SessionState(
+        challenge_name="test",
+        challenge_dir=str(tmp_path),
+        description="solve me",
+        category="misc",
+        confirmed_flag="FLAG{regex_only_legacy}",
+        confirmed_status=None,
+        winner_id="claude-0",
+        solvers=[SolverState(solver_id="claude-0", provider="claude", status="solved", flag="FLAG{regex_only_legacy}")],
+    )
+
+    await swarm.run()
+
+    assert "claude-0" in provider.sessions  # re-run, not skipped
+    assert swarm.confirmed_flag is None
 
 
 async def test_regex_text_mention_does_not_penalize_submit(tmp_path, patch_backends):
@@ -419,6 +483,20 @@ def test_create_solvers_claude_gets_no_extra_binds(tmp_path, monkeypatch):
     assert called == []
 
 
+def test_prepare_codex_subscription_home_denied_by_default(tmp_path):
+    from pytest import raises
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inst = SolverInstance(
+        solver_id="codex-0", provider_name="codex", model_spec="gpt-5.6-sol",
+        sandbox=_FakeSandboxWithWorkspace(str(workspace)),
+    )
+    with raises(RuntimeError, match="explicit policy opt-in"):
+        ChallengeSwarm._prepare_codex_subscription_home(inst)
+    assert not (workspace / ".codex-home" / "auth.json").exists()
+
+
 def test_prepare_codex_subscription_home_copies_auth_json(tmp_path, monkeypatch):
     fake_home = tmp_path / "fakehome"
     (fake_home / ".codex").mkdir(parents=True)
@@ -432,7 +510,7 @@ def test_prepare_codex_subscription_home_copies_auth_json(tmp_path, monkeypatch)
         sandbox=_FakeSandboxWithWorkspace(str(workspace)),
     )
 
-    ChallengeSwarm._prepare_codex_subscription_home(inst)
+    ChallengeSwarm._prepare_codex_subscription_home(inst, allow_exposure=True)
 
     copied = workspace / ".codex-home" / "auth.json"
     assert copied.read_text() == '{"token": "secret"}'
@@ -454,7 +532,7 @@ def test_prepare_codex_subscription_home_no_host_auth_still_creates_dir(tmp_path
         sandbox=_FakeSandboxWithWorkspace(str(workspace)),
     )
 
-    ChallengeSwarm._prepare_codex_subscription_home(inst)
+    ChallengeSwarm._prepare_codex_subscription_home(inst, allow_exposure=True)
 
     assert (workspace / ".codex-home").is_dir()
     assert not (workspace / ".codex-home" / "auth.json").exists()

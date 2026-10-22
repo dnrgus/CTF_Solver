@@ -363,7 +363,7 @@ async def test_codex_coordinator_gets_its_own_sandbox(monkeypatch, tmp_path):
 
     coordinator = CoordinatorAgent(
         provider_name="codex",
-        settings=Settings(codex_count=1, no_docker=False),
+        settings=Settings(codex_count=1, no_docker=False, allow_container_credentials=True),
         event_bus=EventBus(),
         cost_tracker=coordinator_mod.CostTracker(),
         message_bus=ChallengeMessageBus(),

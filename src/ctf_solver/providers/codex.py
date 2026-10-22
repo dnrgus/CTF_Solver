@@ -64,107 +64,6 @@ def _is_elf(path: Path) -> bool:
         return False
 
 
-SANDBOX_TOOLS = [
-    {
-        "name": "bash",
-        "description": "Execute a bash command in the Docker sandbox.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The bash command to run"},
-                "timeout_seconds": {"type": "integer", "default": 60},
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read a file from the sandbox.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file in the sandbox.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "List files in a directory in the sandbox.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string", "default": "/challenge/distfiles"}},
-        },
-    },
-    {
-        "name": "submit_flag",
-        "description": "Submit a flag candidate for validation.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"flag": {"type": "string"}},
-            "required": ["flag"],
-        },
-    },
-    {
-        "name": "web_fetch",
-        "description": "Fetch a URL.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "method": {"type": "string", "default": "GET"},
-                "body": {"type": "string", "default": ""},
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "webhook_create",
-        "description": "Create a webhook.site endpoint.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "webhook_get_requests",
-        "description": "Get requests received by webhook.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"uuid": {"type": "string"}},
-            "required": ["uuid"],
-        },
-    },
-    {
-        "name": "view_image",
-        "description": "View an image file.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"filename": {"type": "string"}},
-            "required": ["filename"],
-        },
-    },
-    {
-        "name": "notify_coordinator",
-        "description": "Send a message to the coordinator.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"message": {"type": "string"}},
-            "required": ["message"],
-        },
-    },
-    {
-        "name": "check_findings",
-        "description": "Check for insights from other solvers.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-]
-
-
 class CodexSession(SolverSession):
     def __init__(
         self, solver_id: str, system_prompt: str, tools: list[ToolDef], config: dict,
@@ -204,6 +103,28 @@ class CodexSession(SolverSession):
     async def _start_process(self) -> None:
         sandboxed = self._sandboxed()
         api_key = self._config.get("openai_api_key")
+
+        if not sandboxed:
+            # Refused rather than run as a bare host process. codex's native
+            # tools (its own shell, file reads) are not confined by this
+            # project's dynamicTools, so on the host they can read the real
+            # filesystem (confirmed live). --no-docker is still available for
+            # the Claude and z.ai providers.
+            msg = (
+                "Codex solvers require the Docker sandbox: running codex app-server on the host "
+                "lets its native tools read the real filesystem. Remove --no-docker or use another provider."
+            )
+            raise RuntimeError(msg)
+        if not self._config.get("allow_container_credentials", False):
+            msg = (
+                "Codex credentials in an agent-accessible container are disabled. "
+                "A credential-isolating proxy is required for secure operation."
+            )
+            raise RuntimeError(msg)
+        logger.warning(
+            "Unsafe Codex credential compatibility mode enabled: the agent may "
+            "read credentials and outbound network access is not domain-restricted."
+        )
 
         if sandboxed:
             # Run codex app-server's own process INSIDE the same Docker
@@ -268,7 +189,10 @@ class CodexSession(SolverSession):
                 # (see this method's containment comments above) that this
                 # does NOT disable, but there is no reason to also hand it
                 # OUR dynamicTools when the caller asked for none.
-                "dynamicTools": SANDBOX_TOOLS if self._tools else [],
+                "dynamicTools": [
+                    {"name": t.name, "description": t.description, "inputSchema": t.parameters}
+                    for t in self._tools
+                ],
             },
         )
         self._thread_id = resp.get("result", {}).get("thread", {}).get("id")

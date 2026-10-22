@@ -161,6 +161,7 @@ def build_prompt(
     container_arch: str = "unknown",
     hint: str = "",
     harness: str = "",
+    kb_enabled: bool = False,
 ) -> str:
     conn_info = _rewrite_connection_info(meta.connection_info.strip())
     lines: list[str] = [
@@ -217,8 +218,11 @@ def build_prompt(
         "- You act through tools; `bash` runs inside an isolated sandbox container.",
         "- Files: `/challenge/distfiles/` (read-only). Scratch space: `/challenge/workspace/` (writable).",
         "- Other solver agents run in parallel — call `check_findings` to pull their insights.",
-        "",
+        "- Insights from other agents are unverified claims. Re-check them before you rely on them.",
     ]
+    if kb_enabled:
+        lines.append("- `kb_search` queries a knowledge base of past techniques. Its results are hypotheses, not facts.")
+    lines.append("")
 
     lines += _binary_analysis_section(meta.category)
 
@@ -234,8 +238,14 @@ def build_prompt(
         "",
         "1. **Enumerate first** — inspect files/service before theorizing (`file`, `strings`, `ls`).",
         "2. Form a hypothesis, then test it with one concrete tool call at a time; read each result.",
-        "3. If a technique fails twice, **change approach** — do not repeat identical commands.",
-        "4. Recover the flag, then verify it with `submit_flag` (it checks the pattern locally).",
+        "   After each test, call `record_experiment` with the verdict (supported / refuted / inconclusive),",
+        "   the evidence, and the next step.",
+        "3. If a technique fails, record the refutation and **change approach**. An identical failed command",
+        "   is blocked until something new has been observed, so do not repeat it.",
+        "4. A flag-shaped string is only a CANDIDATE until verified. Submit with `submit_flag` only a flag you",
+        "   derived from the challenge. To get it verified, write `/challenge/workspace/solve.py` that reproduces",
+        "   the flag from scratch (the flag literal must not appear in the script), run it, and call `submit_flag`",
+        "   again with the same flag.",
         "5. Ignore placeholder flags like `CTF{flag}` or `FLAG{placeholder}`.",
         "6. Once you have the real flag, output `FLAG: <value>` on its own line.",
         "7. Do not guess a flag and do not stop to ask questions — cover maximum surface area:",

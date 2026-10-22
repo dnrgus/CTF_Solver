@@ -8,6 +8,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from ctf_solver.tools.flag import DEFAULT_FLAG_PATTERN
+
 # yakisoba's own hardcoded default. Still used whenever an OPENAI_API_KEY is
 # configured — fine for a billed API key, which accepts arbitrary model ids.
 _API_KEY_DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -62,6 +64,11 @@ class Settings(BaseSettings):
     sandbox_memory: str = "4g"
     sandbox_cpus: int = 2
     no_docker: bool = False
+    sandbox_network_mode: str = "none"  # "bridge" gives unrestricted egress; opt in
+    sandbox_allow_host_gateway: bool = False
+    # Temporary compatibility escape hatch only: an LLM capable of shell access
+    # inside its own auth-bearing container can read/exfiltrate the token.
+    allow_container_credentials: bool = False
 
     # Limits
     # No per-challenge wall-clock cap by default — matches verialabs' own
@@ -75,12 +82,24 @@ class Settings(BaseSettings):
     timeout: int = 86400  # 24h
     max_steps: int = 100
     max_cost: float = 10.0
-    flag_pattern: str = r"([Ff][Ll][Aa][Gg]|[Cc][Tt][Ff])\{[^}]+\}"
+    # Exact format of the target competition. Matched as a whole string, never as a substring.
+    flag_pattern: str = DEFAULT_FLAG_PATTERN
 
-    # Hints
-    # No external judge in manual mode, so a pattern match is the only check.
-    # --strict-flags turns this off (candidates are recorded but never confirmed).
-    accept_regex_flag_as_verified: bool = True
+    # Verification
+    # A regex match is only a CANDIDATE. A flag becomes verified only through an
+    # operator-supplied verifier command (REMOTE_CONFIRMED) or a solve.py that
+    # reproduces it in a fresh sandbox (LOCALLY_REPRODUCED). See verification.py.
+    verifier_cmd: str = ""
+
+    # Adaptive scheduling: how many solver agents may be started per challenge
+    # (the pool comes from --claude/--codex/--zai counts). Agent 1 always starts.
+    max_agents: int = Field(default=1, ge=1, le=3)
+    stall_steps: int = Field(default=8, ge=1)
+    min_budget_fraction: float = Field(default=0.3, ge=0.0, le=1.0)
+
+    # Knowledge base (ctf-knowledge-base checkout). Empty disables kb_search.
+    kb_dir: str = ""
+
     max_bumps: int = 2
     harness_file: str = ""
     hint: str = ""
@@ -107,6 +126,7 @@ class Settings(BaseSettings):
             "claude_model": self.claude_model,
             "codex_model": self.codex_model,
             "zai_model": self.zai_model,
+            "allow_container_credentials": self.allow_container_credentials,
         }
 
 
